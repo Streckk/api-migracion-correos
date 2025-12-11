@@ -17,6 +17,9 @@ mongodb = "3"
 aes-gcm = "0.10"
 base64 = "0.21"
 rand = "0.8"
+ssh2 = "0.9"
+async-trait = "0.1"
+thiserror = "1"
 
 [dev-dependencies]
 cargo-watch = "8.4.1"

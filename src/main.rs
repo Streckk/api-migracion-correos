@@ -5,6 +5,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 mod entities;
 mod routes;
+mod ssh;
 mod state;
 
 use state::AppState;
