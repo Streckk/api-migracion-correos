@@ -1,0 +1,16 @@
+[package]
+name = "correo-migrador-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros", "json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+dotenvy = "0.15"
+aws-sdk-s3 = "1"
+sea-orm = { version = "2.0.0-rc.20", features = ["macros", "runtime-tokio-rustls", "sqlx-mysql"] }
+mongodb = "3"
