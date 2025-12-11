@@ -1,33 +1,34 @@
-use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, JsonValue, Statement};
+use axum::{ extract::State, http::StatusCode, response::IntoResponse, routing::get, Json, Router };
+use sea_orm::{ ConnectionTrait, DbBackend, FromQueryResult, JsonValue, Statement };
 
-use crate::{
-    routes::structs::{DbCheckResponse, MailConfigListResponse},
-    state::AppState,
-};
+use crate::{ routes::structs::{ DbCheckResponse, MailConfigListResponse }, state::AppState };
 
 async fn db_connection_check(State(state): State<AppState>) -> impl IntoResponse {
     match state.mysql.ping().await {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(DbCheckResponse {
-                status: "ok".to_string(),
-                detail: "Conexión exitosa a MySQL".to_string(),
-            }),
-        ),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(DbCheckResponse {
-                status: "error".to_string(),
-                detail: format!("Error al verificar MySQL: {err}"),
-            }),
-        ),
+        Ok(_) =>
+            (
+                StatusCode::OK,
+                Json(DbCheckResponse {
+                    status: "ok".to_string(),
+                    detail: "Conexión exitosa a MySQL".to_string(),
+                }),
+            ),
+        Err(err) =>
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(DbCheckResponse {
+                    status: "error".to_string(),
+                    detail: format!("Error al verificar MySQL: {err}"),
+                }),
+            ),
     }
 }
 
 async fn list_mail_configs(State(state): State<AppState>) -> impl IntoResponse {
-    let statement =
-        Statement::from_string(DbBackend::MySql, "SELECT * FROM configuracion_de_correos");
+    let statement = Statement::from_string(
+        DbBackend::MySql,
+        "SELECT * FROM configuracion_de_correos"
+    );
 
     match state.mysql.query_all_raw(statement).await {
         Ok(rows) => {
@@ -45,14 +46,15 @@ async fn list_mail_configs(State(state): State<AppState>) -> impl IntoResponse {
                 }),
             )
         }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(MailConfigListResponse {
-                status: "error".to_string(),
-                rows: Vec::new(),
-                detail: Some(format!("Error ejecutando SELECT: {err}")),
-            }),
-        ),
+        Err(err) =>
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MailConfigListResponse {
+                    status: "error".to_string(),
+                    rows: Vec::new(),
+                    detail: Some(format!("Error ejecutando SELECT: {err}")),
+                }),
+            ),
     }
 }
 

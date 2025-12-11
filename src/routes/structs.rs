@@ -31,3 +31,15 @@ pub struct MongoCheckResponse {
     pub status: String,
     pub detail: String,
 }
+
+#[derive(Serialize)]
+pub struct MongoSetupResponse {
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct MongoSyncResponse {
+    pub status: String,
+    pub detail: String,
+}
