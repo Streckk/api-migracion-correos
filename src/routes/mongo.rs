@@ -1,34 +1,31 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
-    Aes256Gcm,
-    Nonce,
-};
+use aes_gcm::{ aead::{ Aead, KeyInit, OsRng }, Aes256Gcm, Nonce };
 use axum::{
     extract::State,
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{ get, post },
     Json,
     Router,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use mongodb::bson::{doc, oid::ObjectId};
+use mongodb::bson::{ doc, oid::ObjectId };
 use rand::RngCore;
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ ConnectionTrait, DbBackend, Statement };
 
 use crate::{
     entities::email_config::EmailConfigDocument,
-    routes::structs::{MongoCheckResponse, MongoSetupResponse, MongoSyncResponse},
+    routes::structs::{ MongoCheckResponse, MongoSetupResponse, MongoSyncResponse },
     state::AppState,
 };
 
 fn build_cipher_from_env() -> Result<Aes256Gcm, String> {
-    let key_b64 = std::env::var("ENCRYPTION_KEY")
+    let key_b64 = std::env
+        ::var("ENCRYPTION_KEY")
         .map_err(|_| "ENCRYPTION_KEY no está configurada".to_string())?;
-    let key_bytes = BASE64_STANDARD
-        .decode(key_b64.trim())
-        .map_err(|err| format!("No se pudo decodificar ENCRYPTION_KEY: {err}"))?;
+    let key_bytes = BASE64_STANDARD.decode(key_b64.trim()).map_err(|err|
+        format!("No se pudo decodificar ENCRYPTION_KEY: {err}")
+    )?;
     Aes256Gcm::new_from_slice(&key_bytes).map_err(|err| format!("Clave AES inválida: {err}"))
 }
 
@@ -99,18 +96,38 @@ async fn setup_mongo_collections(State(state): State<AppState>) -> impl IntoResp
 }
 
 async fn sync_email_configs_from_mysql(State(state): State<AppState>) -> impl IntoResponse {
-    let db_name = std::env
-        ::var("MONGO_DB_NAME")
-        .unwrap_or_else(|_| "correos_exchange_queretaro".into());
-    let collection_name = std::env
-        ::var("MONGO_CONFIG_COLLECTION")
-        .unwrap_or_else(|_| "configuration".into());
+    let db_name = match std::env::var("MONGO_DB_NAME") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MongoSyncResponse {
+                    status: "error".to_string(),
+                    detail: "MONGO_DB_NAME no está configurada".to_string(),
+                }),
+            );
+        }
+    };
+    let collection_name = match std::env::var("MONGO_CONFIG_COLLECTION") {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MongoSyncResponse {
+                    status: "error".to_string(),
+                    detail: "MONGO_CONFIG_COLLECTION no está configurada".to_string(),
+                }),
+            );
+        }
+    };
     let client_id = std::env::var("API_CLIENT_ID").unwrap_or_default();
     let client_secret = std::env::var("API_CLIENT_SECRET").unwrap_or_default();
     let tenant_id = std::env::var("API_TENANT_ID").unwrap_or_default();
 
-    let statement =
-        Statement::from_string(DbBackend::MySql, "SELECT * FROM configuracion_de_correos");
+    let statement = Statement::from_string(
+        DbBackend::MySql,
+        "SELECT * FROM configuracion_de_correos"
+    );
 
     let rows = match state.mysql.query_all_raw(statement).await {
         Ok(rows) => rows,
@@ -127,18 +144,18 @@ async fn sync_email_configs_from_mysql(State(state): State<AppState>) -> impl In
 
     let cipher = match build_cipher_from_env() {
         Ok(cipher) => cipher,
-        Err(err) =>
+        Err(err) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MongoSyncResponse {
                     status: "error".to_string(),
                     detail: err,
                 }),
-            ),
+            );
+        }
     };
 
-    let collection = state
-        .mongo
+    let collection = state.mongo
         .database(&db_name)
         .collection::<EmailConfigDocument>(&collection_name);
 
@@ -157,32 +174,33 @@ async fn sync_email_configs_from_mysql(State(state): State<AppState>) -> impl In
             continue;
         }
 
-        match collection
-            .find_one(doc! { "incoming_email": &incoming_email })
-            .await
-        {
-            Ok(Some(_)) => continue,
+        match collection.find_one(doc! { "incoming_email": &incoming_email }).await {
+            Ok(Some(_)) => {
+                continue;
+            }
             Ok(None) => {}
-            Err(err) =>
+            Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(MongoSyncResponse {
                         status: "error".to_string(),
                         detail: format!("Error al verificar duplicados en MongoDB: {err}"),
                     }),
-                ),
+                );
+            }
         }
 
         let encrypted_password = match encrypt_password(&cipher, &password) {
             Ok(value) => value,
-            Err(err) =>
+            Err(err) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(MongoSyncResponse {
                         status: "error".to_string(),
                         detail: err,
                     }),
-                ),
+                );
+            }
         };
 
         let document = EmailConfigDocument {
