@@ -17,3 +17,6 @@ mongodb = "3"
 aes-gcm = "0.10"
 base64 = "0.21"
 rand = "0.8"
+
+[dev-dependencies]
+cargo-watch = "8.4.1"
