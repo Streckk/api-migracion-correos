@@ -8,6 +8,8 @@ pub struct EmailConfigDocument {
     pub name_session: String,
     pub email: String,
     pub outbound_email: String,
+    #[serde(default)]
+    pub incoming_email: String,
     pub incoming_server: String,
     pub outbound_server: String,
     pub imap_server: String,

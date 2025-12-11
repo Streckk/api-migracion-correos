@@ -14,3 +14,6 @@ dotenvy = "0.15"
 aws-sdk-s3 = "1"
 sea-orm = { version = "2.0.0-rc.20", features = ["macros", "runtime-tokio-rustls", "sqlx-mysql"] }
 mongodb = "3"
+aes-gcm = "0.10"
+base64 = "0.21"
+rand = "0.8"
