@@ -21,6 +21,7 @@ ssh2 = "0.9"
 async-trait = "0.1"
 thiserror = "1"
 mime_guess = "2"
+chrono = "0.4"
 
 [dev-dependencies]
 cargo-watch = "8.4.1"

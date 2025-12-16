@@ -19,20 +19,31 @@ pub struct MsgStructDocument {
     pub date_creation: Option<DateTime>,
     #[serde(rename = "date_buzon")]
     pub date_buzon: Option<DateTime>,
-    #[serde(rename = "date_meeting")]
-    pub date_meeting: Option<DateTime>,
     pub from: Option<MsgContact>,
     pub to: Vec<MsgContact>,
     pub cc: Vec<MsgContact>,
     pub subject: Option<String>,
     pub conversation: Option<String>,
-    pub meeting: Option<String>,
-    pub viewed: bool,
-    pub remove: bool,
-    pub priority: Option<String>,
-    pub spam: bool,
-    pub file: bool,
-    pub me: bool,
-    pub category: Option<String>,
-    pub folder: Option<String>,
+    #[serde(rename = "num_caso")]
+    pub num_caso: Option<String>,
+    #[serde(rename = "Fechas_estatus")]
+    pub fechas_estatus: Option<DateTime>,
+    #[serde(rename = "Nombre_cliente")]
+    pub nombre_cliente: Option<String>,
+    #[serde(rename = "Estatus")]
+    pub estatus: Option<String>,
+    #[serde(rename = "Agente_asignado")]
+    pub agente_asignado: Option<String>,
+    #[serde(rename = "Categoria")]
+    pub categoria: Option<String>,
+    #[serde(rename = "Subcategoria")]
+    pub subcategoria: Option<String>,
+    #[serde(rename = "Fecha_cerrada")]
+    pub fecha_cerrada: Option<DateTime>,
+    #[serde(rename = "Fecha_cliente")]
+    pub fecha_cliente: Option<DateTime>,
+    #[serde(rename = "Numero_lineas")]
+    pub numero_lineas: Option<String>,
+    #[serde(rename = "Lista_caso")]
+    pub lista_caso: Option<String>,
 }

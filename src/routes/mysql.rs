@@ -107,7 +107,16 @@ async fn get_incoming_email_by_case(
         Ok(rows) => {
             let payload = rows
                 .into_iter()
-                .map(|row| JsonValue::from_query_result(&row, "").unwrap_or(JsonValue::Null))
+                .map(|row| {
+                    let mut json =
+                        JsonValue::from_query_result(&row, "").unwrap_or(JsonValue::Null);
+                    if let JsonValue::Object(ref mut map) = json {
+                        if let Some(val) = map.remove("Num_Caso") {
+                            map.insert("num_caso".to_string(), val);
+                        }
+                    }
+                    json
+                })
                 .collect::<Vec<_>>();
             (
                 StatusCode::OK,

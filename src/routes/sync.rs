@@ -7,9 +7,10 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use chrono::NaiveDateTime;
 use mime_guess::MimeGuess;
 use mongodb::bson::{doc, oid::ObjectId};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use tracing::{error, info};
 
 use crate::{
@@ -150,9 +151,8 @@ async fn sync_ticket_case(
         id: ObjectId::new(),
         id_mail: mysql_record.id_mail.unwrap_or_default(),
         mime_id: inserted_id,
-        date_creation: None,
-        date_buzon: None,
-        date_meeting: None,
+        date_creation: parse_mysql_datetime(mysql_record.fecha_de_registro.as_deref()),
+        date_buzon: parse_mysql_datetime(mysql_record.fecha_buzon.as_deref()),
         from: mysql_record.from_email.as_ref().map(|email| MsgContact {
             name: mysql_record.from_name.clone(),
             email: Some(email.clone()),
@@ -165,18 +165,27 @@ async fn sync_ticket_case(
                 email: Some(email.clone()),
             })
             .collect(),
-        cc: Vec::new(),
+        cc: mysql_record
+            .cc_emails
+            .iter()
+            .map(|email| MsgContact {
+                name: None,
+                email: Some(email.clone()),
+            })
+            .collect(),
         subject: mysql_record.subject.clone(),
         conversation: Some(case_id.to_string()),
-        meeting: None,
-        viewed: false,
-        remove: false,
-        priority: None,
-        spam: false,
-        file: true,
-        me: false,
-        category: None,
-        folder: None,
+        num_caso: Some(case_id.to_string()),
+        fechas_estatus: parse_mysql_datetime(mysql_record.fechas_estatus.as_deref()),
+        nombre_cliente: mysql_record.nombre_cliente.clone(),
+        estatus: mysql_record.estatus.clone(),
+        agente_asignado: mysql_record.agente_asignado.clone(),
+        categoria: mysql_record.categoria.clone(),
+        subcategoria: mysql_record.subcategoria.clone(),
+        fecha_cerrada: parse_mysql_datetime(mysql_record.fecha_cerrada.as_deref()),
+        fecha_cliente: parse_mysql_datetime(mysql_record.fecha_cliente.as_deref()),
+        numero_lineas: mysql_record.numero_lineas.clone(),
+        lista_caso: mysql_record.lista_caso.clone(),
     };
 
     struct_collection.insert_one(msg_struct_doc.clone()).await?;
@@ -214,23 +223,57 @@ async fn fetch_mysql_record(
         return Err(TicketSyncError::CaseNotFound(case_id.to_string()));
     };
 
-    let subject = get_string(&row, "Asunto");
-    let from_email = get_string(&row, "Correo_Entrada");
-    let from_name = get_string(&row, "Remitente");
-    let to_emails = split_emails(get_string(&row, "Correo_Destino"));
-    let config_email = get_string(&row, "Correo_Telcel");
+    let subject = get_any_string(&row, &["Asunto"]);
+    let from_email = get_any_string(&row, &["Correo_Entrada", "Correo"]);
+    let from_name = get_any_string(&row, &["Remitente", "Nombre_cliente", "Nombre_Cliente"]);
+    let to_emails = split_emails(get_any_string(&row, &["Correo_Destino", "Correos_To"]));
+    let cc_emails = split_emails(get_any_string(&row, &["Correos_CC"]));
+    let config_email = get_any_string(&row, &["Correo_Telcel"]);
     let id_mail = row
         .try_get("", "Id_Correo")
         .ok()
         .or_else(|| row.try_get("", "IdCorreo").ok());
+
+    let fechas_estatus =
+        get_any_string(&row, &["Fechas_estatus", "Fecha_Estatus", "Fechas_Estatus"]);
+    let nombre_cliente = get_any_string(&row, &["Nombre_cliente", "Nombre_Cliente"]);
+    let estatus = get_any_string(&row, &["Estatus"]);
+    let agente_asignado = get_any_string(&row, &["Agente_asignado", "Agente_Asignado"]);
+    let categoria = get_any_string(&row, &["Categoria"]);
+    let subcategoria = get_any_string(&row, &["Subcategoria", "Subcategoría", "SubCategoría"]);
+    let fecha_cerrada = get_any_string(&row, &["Fecha_cerrada", "Fecha_Cerrada"]);
+    let fecha_cliente = get_any_string(&row, &["Fecha_cliente", "Fecha_Cliente"]);
+    let numero_lineas = get_any_string(&row, &["Numero_lineas", "Numero_Lineas"]);
+    let lista_caso = get_any_string(&row, &["Lista_caso", "Lista_Caso"]);
+    let fecha_buzon = get_any_string(
+        &row,
+        &["Fecha_buzon", "Fecha_Buzon", "Fecha_Buzón", "Fecha_buzón"],
+    );
+    let fecha_de_registro = get_any_string(
+        &row,
+        &["Fecha_de_Registro", "Fecha_de_registro", "Fecha_Registro"],
+    );
 
     Ok(MysqlEmailRecord {
         subject,
         from_email,
         from_name,
         to_emails,
+        cc_emails,
         id_mail,
         config_email,
+        fecha_buzon,
+        fechas_estatus,
+        nombre_cliente,
+        estatus,
+        agente_asignado,
+        categoria,
+        subcategoria,
+        fecha_cerrada,
+        fecha_cliente,
+        numero_lineas,
+        lista_caso,
+        fecha_de_registro,
     })
 }
 
@@ -472,8 +515,21 @@ struct MysqlEmailRecord {
     from_email: Option<String>,
     from_name: Option<String>,
     to_emails: Vec<String>,
+    cc_emails: Vec<String>,
     id_mail: Option<i64>,
     config_email: Option<String>,
+    fecha_buzon: Option<String>,
+    fechas_estatus: Option<String>,
+    nombre_cliente: Option<String>,
+    estatus: Option<String>,
+    agente_asignado: Option<String>,
+    categoria: Option<String>,
+    subcategoria: Option<String>,
+    fecha_cerrada: Option<String>,
+    fecha_cliente: Option<String>,
+    numero_lineas: Option<String>,
+    lista_caso: Option<String>,
+    fecha_de_registro: Option<String>,
 }
 
 fn get_string(row: &sea_orm::QueryResult, column: &str) -> Option<String> {
@@ -481,6 +537,11 @@ fn get_string(row: &sea_orm::QueryResult, column: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            row.try_get::<NaiveDateTime>("", column)
+                .ok()
+                .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+        })
 }
 
 fn split_emails(raw: Option<String>) -> Vec<String> {
@@ -493,6 +554,43 @@ fn split_emails(raw: Option<String>) -> Vec<String> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn get_any_string(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<String> {
+    columns.iter().find_map(|column| get_string(row, column))
+}
+
+fn parse_mysql_datetime(raw: Option<&str>) -> Option<mongodb::bson::DateTime> {
+    const FORMATS: [&str; 3] = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %I:%M:%S%p", "%Y-%m-%d %H:%M"];
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        let normalized = if trimmed
+            .rsplit_once(' ')
+            .map(|(_, suffix)| {
+                suffix.eq_ignore_ascii_case("am") || suffix.eq_ignore_ascii_case("pm")
+            })
+            .unwrap_or(false)
+        {
+            let mut parts = trimmed.rsplitn(2, ' ');
+            let suffix = parts.next().unwrap().to_uppercase();
+            let prefix = parts.next().unwrap_or("");
+            format!("{prefix} {suffix}")
+        } else if trimmed.ends_with("am")
+            || trimmed.ends_with("pm")
+            || trimmed.ends_with("AM")
+            || trimmed.ends_with("PM")
+        {
+            let (prefix, suffix) = trimmed.split_at(trimmed.len().saturating_sub(2));
+            format!("{}{}", prefix, suffix.to_uppercase())
+        } else {
+            trimmed.to_string()
+        };
+
+        FORMATS
+            .iter()
+            .find_map(|fmt| NaiveDateTime::parse_from_str(&normalized, fmt).ok())
+            .map(|naive| mongodb::bson::DateTime::from_millis(naive.and_utc().timestamp_millis()))
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
