@@ -129,9 +129,12 @@ async fn sync_ticket_case(
         html_body
     };
 
+    let message_type = "entrada".to_string();
+
     let mime_document = MsgMimeDocument {
         id: ObjectId::new(),
         configuration_id,
+        message_type: message_type.clone(),
         text: mysql_record.subject.clone().unwrap_or_default(),
         file_mime: "text/html".to_string(),
         html: html_content,
@@ -151,6 +154,7 @@ async fn sync_ticket_case(
         id: ObjectId::new(),
         id_mail: mysql_record.id_mail.unwrap_or_default(),
         mime_id: inserted_id,
+        configuration_id,
         date_creation: parse_mysql_datetime(mysql_record.fecha_de_registro.as_deref()),
         date_buzon: parse_mysql_datetime(mysql_record.fecha_buzon.as_deref()),
         from: mysql_record.from_email.as_ref().map(|email| MsgContact {
@@ -173,6 +177,7 @@ async fn sync_ticket_case(
                 email: Some(email.clone()),
             })
             .collect(),
+        message_type,
         subject: mysql_record.subject.clone(),
         conversation: Some(case_id.to_string()),
         num_caso: Some(case_id.to_string()),

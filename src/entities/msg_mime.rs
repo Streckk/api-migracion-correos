@@ -25,6 +25,8 @@ pub struct MsgMimeDocument {
     pub id: ObjectId,
     #[serde(rename = "_id_configuration")]
     pub configuration_id: ObjectId,
+    #[serde(rename = "message_type")]
+    pub message_type: String,
     pub text: String,
     #[serde(rename = "fileMime")]
     pub file_mime: String,

@@ -15,6 +15,8 @@ pub struct MsgStructDocument {
     pub id_mail: i64,
     #[serde(rename = "_id_mime")]
     pub mime_id: ObjectId,
+    #[serde(rename = "_id_configuration")]
+    pub configuration_id: ObjectId,
     #[serde(rename = "date_creation")]
     pub date_creation: Option<DateTime>,
     #[serde(rename = "date_buzon")]
@@ -22,6 +24,8 @@ pub struct MsgStructDocument {
     pub from: Option<MsgContact>,
     pub to: Vec<MsgContact>,
     pub cc: Vec<MsgContact>,
+    #[serde(rename = "message_type")]
+    pub message_type: String,
     pub subject: Option<String>,
     pub conversation: Option<String>,
     #[serde(rename = "num_caso")]
