@@ -35,6 +35,4 @@ pub struct MsgStructDocument {
     pub me: bool,
     pub category: Option<String>,
     pub folder: Option<String>,
-    #[serde(rename = "msgMime")]
-    pub msg_mime: Option<ObjectId>,
 }

@@ -6,6 +6,7 @@ pub mod mysql;
 pub mod ssh;
 pub mod storage;
 pub mod structs;
+pub mod sync;
 
 use crate::state::AppState;
 
@@ -16,4 +17,5 @@ pub fn router() -> Router<AppState> {
         .merge(mongo::router())
         .merge(storage::router())
         .merge(ssh::router())
+        .merge(sync::router())
 }

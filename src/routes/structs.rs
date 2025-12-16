@@ -27,6 +27,22 @@ pub struct MailConfigListResponse {
 }
 
 #[derive(Serialize)]
+pub struct IncomingMailResponse {
+    pub status: String,
+    pub rows: Vec<JsonValue>,
+    pub detail: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TicketSyncResponse {
+    pub status: String,
+    pub detail: String,
+    pub uploaded: Vec<String>,
+    pub mongo_id: Option<String>,
+    pub msg_struct_id: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct MongoCheckResponse {
     pub status: String,
     pub detail: String,

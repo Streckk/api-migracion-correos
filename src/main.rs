@@ -7,6 +7,7 @@ mod entities;
 mod routes;
 mod ssh;
 mod state;
+mod storage;
 
 use state::AppState;
 
