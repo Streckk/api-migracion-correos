@@ -14,3 +14,14 @@ dotenvy = "0.15"
 aws-sdk-s3 = "1"
 sea-orm = { version = "2.0.0-rc.20", features = ["macros", "runtime-tokio-rustls", "sqlx-mysql"] }
 mongodb = "3"
+aes-gcm = "0.10"
+base64 = "0.21"
+rand = "0.8"
+ssh2 = "0.9"
+async-trait = "0.1"
+thiserror = "1"
+mime_guess = "2"
+chrono = "0.4"
+
+[dev-dependencies]
+cargo-watch = "8.4.1"
