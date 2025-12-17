@@ -43,6 +43,15 @@ pub struct TicketSyncResponse {
 }
 
 #[derive(Serialize)]
+pub struct MessageSyncResponse {
+    pub status: String,
+    pub detail: String,
+    pub inserted: usize,
+    pub mime_ids: Vec<String>,
+    pub msg_struct_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub struct MongoCheckResponse {
     pub status: String,
     pub detail: String,

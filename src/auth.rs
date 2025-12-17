@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::State,
     http::{header, HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -10,14 +11,14 @@ use tracing::{debug, warn};
 
 use crate::state::AppState;
 
-pub async fn require_token(req: Request<Body>, next: Next) -> Response {
+pub async fn require_token(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
     let token = match extract_token(req.headers()) {
         Some(token) => token,
         None => return unauthorized_response("Falta encabezado Authorization o X-Api-Key"),
-    };
-
-    let Some(state) = req.extensions().get::<AppState>().cloned() else {
-        return unauthorized_response("No se pudo acceder al estado de la aplicación");
     };
 
     if state.is_token_valid(&token) {

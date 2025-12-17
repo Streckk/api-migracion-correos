@@ -1,7 +1,7 @@
 use std::env;
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
@@ -11,7 +11,8 @@ use chrono::NaiveDateTime;
 use mime_guess::MimeGuess;
 use mongodb::bson::{doc, oid::ObjectId};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
-use tracing::{error, info};
+use serde::Deserialize;
+use tracing::{error, info, warn};
 
 use crate::{
     entities::{
@@ -19,7 +20,7 @@ use crate::{
         msg_mime::{MsgMimeDocument, MsgMimeFile},
         msg_struct::{MsgContact, MsgStructDocument},
     },
-    routes::structs::TicketSyncResponse,
+    routes::structs::{MessageSyncResponse, TicketSyncResponse},
     ssh::config::RemoteDirEntry,
     ssh::SshError,
     state::AppState,
@@ -27,7 +28,24 @@ use crate::{
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/tickets/:case_id/sync", post(sync_single_ticket))
+    Router::new()
+        .route("/tickets/:case_id/sync", post(sync_single_ticket))
+        .route(
+            "/tickets/:case_id/obtener_correos_notas",
+            post(sync_ticket_notes),
+        )
+        .route(
+            "/tickets/:case_id/obtener_correos_respuesta",
+            post(sync_ticket_responses),
+        )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageSyncQuery {
+    #[serde(default)]
+    fecha_inicio: Option<String>,
+    #[serde(default)]
+    fecha_fin: Option<String>,
 }
 
 async fn sync_single_ticket(
@@ -45,6 +63,53 @@ async fn sync_single_ticket(
                 uploaded: Vec::new(),
                 mongo_id: None,
                 msg_struct_id: None,
+            });
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn sync_ticket_notes(
+    State(state): State<AppState>,
+    AxumPath(case_id): AxumPath<String>,
+    Query(filter): Query<MessageSyncQuery>,
+) -> Response {
+    match sync_notes_for_case(&state, &case_id, &filter).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(err) => {
+            error!("Fallo al sincronizar notas del ticket {}: {}", case_id, err);
+            let status = err.status_code();
+            let body = Json(MessageSyncResponse {
+                status: "error".to_string(),
+                detail: err.to_string(),
+                inserted: 0,
+                mime_ids: Vec::new(),
+                msg_struct_ids: Vec::new(),
+            });
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn sync_ticket_responses(
+    State(state): State<AppState>,
+    AxumPath(case_id): AxumPath<String>,
+    Query(filter): Query<MessageSyncQuery>,
+) -> Response {
+    match sync_responses_for_case(&state, &case_id, &filter).await {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(err) => {
+            error!(
+                "Fallo al sincronizar respuestas del ticket {}: {}",
+                case_id, err
+            );
+            let status = err.status_code();
+            let body = Json(MessageSyncResponse {
+                status: "error".to_string(),
+                detail: err.to_string(),
+                inserted: 0,
+                mime_ids: Vec::new(),
+                msg_struct_ids: Vec::new(),
             });
             (status, body).into_response()
         }
@@ -213,6 +278,240 @@ async fn sync_ticket_case(
     })
 }
 
+async fn sync_notes_for_case(
+    state: &AppState,
+    case_id: &str,
+    filter: &MessageSyncQuery,
+) -> Result<MessageSyncResponse, TicketSyncError> {
+    let mysql_record = fetch_mysql_record(state, case_id).await?;
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let config_collection_name =
+        env::var("MONGO_CONFIG_COLLECTION").unwrap_or_else(|_| "configuration".into());
+
+    let config_email = mysql_record
+        .config_email
+        .clone()
+        .ok_or_else(|| TicketSyncError::MissingConfigurationEmail(case_id.to_string()))?;
+    let configuration_id =
+        resolve_configuration_id(state, &db_name, &config_collection_name, &config_email).await?;
+
+    let notes = fetch_case_notes(state, case_id, filter).await?;
+    if notes.is_empty() {
+        return Ok(MessageSyncResponse {
+            status: "ok".to_string(),
+            detail: format!("No se encontraron notas para el caso {}", case_id),
+            inserted: 0,
+            mime_ids: Vec::new(),
+            msg_struct_ids: Vec::new(),
+        });
+    }
+
+    let db = state.mongo.database(&db_name);
+    let mime_collection = db.collection::<MsgMimeDocument>("msg-mime");
+    let struct_collection = db.collection::<MsgStructDocument>("msg-struct");
+    let sanitized_case = sanitize_segment(case_id);
+    let base_prefix = format!("tickets/{}", sanitized_case);
+
+    let mut inserted_mime_ids = Vec::new();
+    let mut inserted_struct_ids = Vec::new();
+
+    for note in notes {
+        if struct_collection
+            .find_one(doc! { "id_mail": note.id })
+            .await?
+            .is_some()
+        {
+            info!(
+                "Nota {} del caso {} ya existe en MongoDB, se omite",
+                note.id, case_id
+            );
+            continue;
+        }
+
+        let folder = sanitize_segment(&format!("Nota_{}", note.id));
+        let prefix = format!("{}/notas/{}", base_prefix, folder);
+        let (files, html_body) = build_files_from_s3(state, &prefix).await?;
+        let html_content = html_body.unwrap_or_else(|| format!("Nota {}", note.id));
+        let summary = note.usuario.clone().unwrap_or_default();
+
+        let mime_document = MsgMimeDocument {
+            id: ObjectId::new(),
+            configuration_id,
+            message_type: "nota".to_string(),
+            text: summary.clone(),
+            file_mime: "text/html".to_string(),
+            html: html_content,
+            is_file_local: false,
+            files,
+        };
+        let mime_id = mime_document.id;
+        mime_collection.insert_one(mime_document.clone()).await?;
+
+        let msg_struct_doc = MsgStructDocument {
+            id: ObjectId::new(),
+            id_mail: note.id,
+            mime_id,
+            configuration_id,
+            date_creation: parse_mysql_datetime(note.fecha_registro.as_deref()),
+            date_buzon: None,
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            message_type: "nota".to_string(),
+            subject: if summary.is_empty() {
+                None
+            } else {
+                Some(summary.clone())
+            },
+            conversation: Some(case_id.to_string()),
+            num_caso: Some(case_id.to_string()),
+            fechas_estatus: None,
+            nombre_cliente: None,
+            estatus: None,
+            agente_asignado: None,
+            categoria: None,
+            subcategoria: None,
+            fecha_cerrada: None,
+            fecha_cliente: None,
+            numero_lineas: None,
+            lista_caso: None,
+        };
+
+        struct_collection.insert_one(msg_struct_doc.clone()).await?;
+
+        inserted_mime_ids.push(mime_id.to_hex());
+        inserted_struct_ids.push(msg_struct_doc.id.to_hex());
+    }
+
+    let inserted = inserted_struct_ids.len();
+    Ok(MessageSyncResponse {
+        status: "ok".to_string(),
+        detail: format!("Se migraron {} notas para el caso {}", inserted, case_id),
+        inserted,
+        mime_ids: inserted_mime_ids,
+        msg_struct_ids: inserted_struct_ids,
+    })
+}
+
+async fn sync_responses_for_case(
+    state: &AppState,
+    case_id: &str,
+    filter: &MessageSyncQuery,
+) -> Result<MessageSyncResponse, TicketSyncError> {
+    let mysql_record = fetch_mysql_record(state, case_id).await?;
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let config_collection_name =
+        env::var("MONGO_CONFIG_COLLECTION").unwrap_or_else(|_| "configuration".into());
+
+    let config_email = mysql_record
+        .config_email
+        .clone()
+        .ok_or_else(|| TicketSyncError::MissingConfigurationEmail(case_id.to_string()))?;
+    let configuration_id =
+        resolve_configuration_id(state, &db_name, &config_collection_name, &config_email).await?;
+
+    let responses = fetch_case_responses(state, case_id, filter).await?;
+    if responses.is_empty() {
+        return Ok(MessageSyncResponse {
+            status: "ok".to_string(),
+            detail: format!("No se encontraron respuestas para el caso {}", case_id),
+            inserted: 0,
+            mime_ids: Vec::new(),
+            msg_struct_ids: Vec::new(),
+        });
+    }
+
+    let db = state.mongo.database(&db_name);
+    let mime_collection = db.collection::<MsgMimeDocument>("msg-mime");
+    let struct_collection = db.collection::<MsgStructDocument>("msg-struct");
+    let sanitized_case = sanitize_segment(case_id);
+    let base_prefix = format!("tickets/{}", sanitized_case);
+
+    let mut inserted_mime_ids = Vec::new();
+    let mut inserted_struct_ids = Vec::new();
+
+    for response in responses {
+        if struct_collection
+            .find_one(doc! { "id_mail": response.id })
+            .await?
+            .is_some()
+        {
+            info!(
+                "Respuesta {} del caso {} ya existe en MongoDB, se omite",
+                response.id, case_id
+            );
+            continue;
+        }
+
+        let folder = sanitize_segment(&format!("Respuesta_Num_-_{}", response.id));
+        let prefix = format!("{}/respuestas/{}", base_prefix, folder);
+        let (files, html_body) = build_files_from_s3(state, &prefix).await?;
+        let subject = response
+            .asunto
+            .clone()
+            .unwrap_or_else(|| format!("Respuesta {}", response.id));
+        let html_content = html_body.unwrap_or_else(|| subject.clone());
+
+        let mime_document = MsgMimeDocument {
+            id: ObjectId::new(),
+            configuration_id,
+            message_type: "respuesta".to_string(),
+            text: subject.clone(),
+            file_mime: "text/html".to_string(),
+            html: html_content,
+            is_file_local: false,
+            files,
+        };
+        let mime_id = mime_document.id;
+        mime_collection.insert_one(mime_document.clone()).await?;
+
+        let from_contact = None;
+
+        let msg_struct_doc = MsgStructDocument {
+            id: ObjectId::new(),
+            id_mail: response.id,
+            mime_id,
+            configuration_id,
+            date_creation: parse_mysql_datetime(response.fecha_registro.as_deref()),
+            date_buzon: None,
+            from: from_contact,
+            to: contacts_from_emails(&response.correos_to),
+            cc: contacts_from_emails(&response.correos_cc),
+            message_type: "respuesta".to_string(),
+            subject: Some(subject.clone()),
+            conversation: Some(case_id.to_string()),
+            num_caso: Some(case_id.to_string()),
+            fechas_estatus: None,
+            nombre_cliente: None,
+            estatus: None,
+            agente_asignado: None,
+            categoria: None,
+            subcategoria: None,
+            fecha_cerrada: None,
+            fecha_cliente: parse_mysql_datetime(response.fecha_cliente.as_deref()),
+            numero_lineas: None,
+            lista_caso: None,
+        };
+
+        struct_collection.insert_one(msg_struct_doc.clone()).await?;
+
+        inserted_mime_ids.push(mime_id.to_hex());
+        inserted_struct_ids.push(msg_struct_doc.id.to_hex());
+    }
+
+    let inserted = inserted_struct_ids.len();
+    Ok(MessageSyncResponse {
+        status: "ok".to_string(),
+        detail: format!(
+            "Se migraron {} respuestas para el caso {}",
+            inserted, case_id
+        ),
+        inserted,
+        mime_ids: inserted_mime_ids,
+        msg_struct_ids: inserted_struct_ids,
+    })
+}
+
 async fn fetch_mysql_record(
     state: &AppState,
     case_id: &str,
@@ -280,6 +579,85 @@ async fn fetch_mysql_record(
         lista_caso,
         fecha_de_registro,
     })
+}
+
+async fn fetch_case_notes(
+    state: &AppState,
+    case_id: &str,
+    filter: &MessageSyncQuery,
+) -> Result<Vec<MysqlNoteRecord>, TicketSyncError> {
+    let mut sql =
+        "SELECT Id, Num_Caso, Usuario, Fecha_de_Registro FROM correos_notas WHERE Num_Caso = ?"
+            .to_string();
+    let mut values = vec![case_id.to_string().into()];
+
+    if let Some(fecha_inicio) = &filter.fecha_inicio {
+        sql.push_str(" AND Fecha_de_Registro >= ?");
+        values.push(fecha_inicio.clone().into());
+    }
+    if let Some(fecha_fin) = &filter.fecha_fin {
+        sql.push_str(" AND Fecha_de_Registro <= ?");
+        values.push(fecha_fin.clone().into());
+    }
+    sql.push_str(" ORDER BY Fecha_de_Registro ASC");
+
+    let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
+    let rows = state.mysql.query_all_raw(statement).await?;
+
+    let mut records = Vec::new();
+    for row in rows {
+        let id = row.try_get::<i64>("", "Id").unwrap_or(0);
+        if id == 0 {
+            continue;
+        }
+        records.push(MysqlNoteRecord {
+            id,
+            usuario: get_string(&row, "Usuario"),
+            fecha_registro: get_string(&row, "Fecha_de_Registro"),
+        });
+    }
+
+    Ok(records)
+}
+
+async fn fetch_case_responses(
+    state: &AppState,
+    case_id: &str,
+    filter: &MessageSyncQuery,
+) -> Result<Vec<MysqlResponseRecord>, TicketSyncError> {
+    let mut sql = "SELECT * FROM correos_respuesta WHERE Num_Caso = ?".to_string();
+    let mut values = vec![case_id.to_string().into()];
+
+    if let Some(fecha_inicio) = &filter.fecha_inicio {
+        sql.push_str(" AND Fecha_de_Registro >= ?");
+        values.push(fecha_inicio.clone().into());
+    }
+    if let Some(fecha_fin) = &filter.fecha_fin {
+        sql.push_str(" AND Fecha_de_Registro <= ?");
+        values.push(fecha_fin.clone().into());
+    }
+    sql.push_str(" ORDER BY Fecha_de_Registro ASC");
+
+    let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
+    let rows = state.mysql.query_all_raw(statement).await?;
+    let mut records = Vec::new();
+
+    for row in rows {
+        let id = row.try_get::<i64>("", "Id").unwrap_or(0);
+        if id == 0 {
+            continue;
+        }
+        records.push(MysqlResponseRecord {
+            id,
+            correos_to: split_emails(get_string(&row, "Correos_To")),
+            correos_cc: split_emails(get_string(&row, "Correos_CC")),
+            asunto: get_string(&row, "Asunto"),
+            fecha_registro: get_string(&row, "Fecha_de_Registro"),
+            fecha_cliente: get_string(&row, "Fecha_Cliente"),
+        });
+    }
+
+    Ok(records)
 }
 
 async fn gather_case_files(
@@ -465,6 +843,62 @@ async fn resolve_configuration_id(
     Ok(document.id)
 }
 
+async fn build_files_from_s3(
+    state: &AppState,
+    prefix: &str,
+) -> Result<(Vec<MsgMimeFile>, Option<String>), TicketSyncError> {
+    let normalized_prefix = prefix.trim_end_matches('/');
+    let list_prefix = if normalized_prefix.is_empty() {
+        normalized_prefix.to_string()
+    } else {
+        format!("{}/", normalized_prefix)
+    };
+    let mut objects = state.storage.list_objects(&list_prefix).await?;
+    objects.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let mut files = Vec::new();
+    let mut html_body = None;
+
+    for object in objects {
+        if object.key.ends_with('/') {
+            continue;
+        }
+        let key = object.key;
+        let key_str = key.as_str();
+        let file_name = key_str.rsplit('/').next().unwrap_or(key_str).to_string();
+
+        if html_body.is_none() && file_name.eq_ignore_ascii_case("index.html") {
+            match state.storage.get_object(&key).await {
+                Ok(bytes) => {
+                    let text = String::from_utf8(bytes)
+                        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+                    html_body = Some(text);
+                }
+                Err(err) => {
+                    warn!("No se pudo leer {key} desde S3 para generar HTML: {err}");
+                }
+            }
+        }
+
+        let mime = MimeGuess::from_path(&file_name)
+            .first_raw()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        files.push(MsgMimeFile {
+            id: ObjectId::new().to_hex(),
+            file_image_html: mime.starts_with("image/") || mime.contains("html"),
+            file_name,
+            file_type: mime,
+            file_size: object.size.max(0).to_string(),
+            file_url: state.storage.object_url(&key),
+            is_file_local: false,
+        });
+    }
+
+    Ok((files, html_body))
+}
+
 #[derive(Clone)]
 struct FileTask {
     remote_path: String,
@@ -515,6 +949,16 @@ fn sanitize_segment(value: &str) -> String {
     }
 }
 
+fn contacts_from_emails(emails: &[String]) -> Vec<MsgContact> {
+    emails
+        .iter()
+        .map(|email| MsgContact {
+            name: None,
+            email: Some(email.clone()),
+        })
+        .collect()
+}
+
 struct MysqlEmailRecord {
     subject: Option<String>,
     from_email: Option<String>,
@@ -535,6 +979,21 @@ struct MysqlEmailRecord {
     numero_lineas: Option<String>,
     lista_caso: Option<String>,
     fecha_de_registro: Option<String>,
+}
+
+struct MysqlNoteRecord {
+    id: i64,
+    usuario: Option<String>,
+    fecha_registro: Option<String>,
+}
+
+struct MysqlResponseRecord {
+    id: i64,
+    correos_to: Vec<String>,
+    correos_cc: Vec<String>,
+    asunto: Option<String>,
+    fecha_registro: Option<String>,
+    fecha_cliente: Option<String>,
 }
 
 fn get_string(row: &sea_orm::QueryResult, column: &str) -> Option<String> {
