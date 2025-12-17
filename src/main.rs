@@ -3,6 +3,7 @@ use sea_orm::Database;
 use std::{env, net::SocketAddr};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod auth;
 mod entities;
 mod routes;
 mod ssh;

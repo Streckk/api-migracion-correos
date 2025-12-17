@@ -1,4 +1,4 @@
-use axum::Router;
+use axum::{middleware, Router};
 
 pub mod health;
 pub mod mongo;
@@ -8,14 +8,18 @@ pub mod storage;
 pub mod structs;
 pub mod sync;
 
-use crate::state::AppState;
+use crate::{auth, state::AppState};
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .merge(health::router())
+    let protected_routes = Router::new()
         .merge(mysql::router())
         .merge(mongo::router())
         .merge(storage::router())
         .merge(ssh::router())
         .merge(sync::router())
+        .layer(middleware::from_fn(auth::require_token));
+
+    Router::new()
+        .merge(health::router())
+        .merge(protected_routes)
 }

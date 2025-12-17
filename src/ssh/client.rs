@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::Read,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -24,8 +24,6 @@ pub enum SshError {
     HostKeyMismatch { host: String },
     #[error("Fallo de autenticación SSH")]
     AuthenticationFailed,
-    #[error("Solicitud inválida: {0}")]
-    InvalidRequest(String),
     #[error("Error interno al ejecutar tarea SSH: {0}")]
     BlockingTaskFailed(String),
 }
@@ -55,12 +53,6 @@ pub trait SshClient: Send + Sync {
         path: &str,
     ) -> SshResult<Vec<RemoteDirEntry>>;
     async fn read_file(&self, connection: &SshConnection, path: &str) -> SshResult<Vec<u8>>;
-    async fn write_file(
-        &self,
-        connection: &SshConnection,
-        path: &str,
-        contents: &[u8],
-    ) -> SshResult<()>;
 }
 
 #[derive(Clone, Default)]
@@ -90,22 +82,8 @@ impl SshClient for Ssh2Client {
                 verify_host_key(&session, &host, &path)?;
             }
 
-            match auth_method {
-                AuthMethod::Password { password } => {
-                    session.userauth_password(&username, &password)?;
-                }
-                AuthMethod::KeyPath {
-                    private_key_path,
-                    passphrase,
-                } => {
-                    session.userauth_pubkey_file(
-                        &username,
-                        None,
-                        Path::new(&private_key_path),
-                        passphrase.as_deref(),
-                    )?;
-                }
-            }
+            let AuthMethod::Password { password } = auth_method;
+            session.userauth_password(&username, &password)?;
 
             if !session.authenticated() {
                 return Err(SshError::AuthenticationFailed);
@@ -180,29 +158,6 @@ impl SshClient for Ssh2Client {
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
             Ok(buffer)
-        })
-        .await
-        .map_err(|err| SshError::BlockingTaskFailed(err.to_string()))?
-    }
-
-    async fn write_file(
-        &self,
-        connection: &SshConnection,
-        path: &str,
-        contents: &[u8],
-    ) -> SshResult<()> {
-        let target_path = path.to_string();
-        let payload = contents.to_vec();
-        let session = connection.session.clone();
-        task::spawn_blocking(move || -> SshResult<()> {
-            let guard = session
-                .lock()
-                .map_err(|_| SshError::BlockingTaskFailed("Mutex poisoned".to_string()))?;
-            let sftp = guard.sftp()?;
-            let mut file = sftp.create(Path::new(&target_path))?;
-            file.write_all(&payload)?;
-            file.flush()?;
-            Ok(())
         })
         .await
         .map_err(|err| SshError::BlockingTaskFailed(err.to_string()))?
