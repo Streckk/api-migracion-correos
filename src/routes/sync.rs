@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::HashSet, env, sync::Arc};
 
 use axum::{
     extract::{Query, State},
@@ -8,8 +8,9 @@ use axum::{
     Json, Router,
 };
 use chrono::NaiveDateTime;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use mime_guess::MimeGuess;
-use mongodb::bson::{doc, oid::ObjectId};
+use mongodb::bson::{doc, oid::ObjectId, Bson};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -26,6 +27,9 @@ use crate::{
     state::AppState,
     storage::StorageError,
 };
+
+const CASE_BATCH_SIZE: usize = 10;
+const FILE_UPLOAD_CONCURRENCY: usize = 4;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -51,7 +55,11 @@ impl DateRangeQuery {
             .fecha_inicio
             .as_ref()
             .map(|value| extract_date(value))?;
-        let end = self.fecha_fin.as_ref().map(|value| extract_date(value));
+        let end = self
+            .fecha_fin
+            .as_ref()
+            .map(|value| extract_date(value))
+            .unwrap_or_else(|| current_date_string());
         Some(DateBounds { start, end })
     }
 }
@@ -59,7 +67,14 @@ impl DateRangeQuery {
 #[derive(Clone)]
 struct DateBounds {
     start: String,
-    end: Option<String>,
+    end: String,
+}
+
+fn current_date_string() -> String {
+    chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn extract_date(value: &str) -> String {
@@ -86,7 +101,8 @@ async fn sync_tickets_by_range(
         return (StatusCode::BAD_REQUEST, body).into_response();
     };
 
-    let case_ids = match fetch_case_ids_by_range(&state, &bounds).await {
+    let total_cases;
+    let cases = match fetch_case_ids_by_range(&state, &bounds).await {
         Ok(ids) => ids,
         Err(err) => {
             let status = err.status_code();
@@ -101,7 +117,8 @@ async fn sync_tickets_by_range(
         }
     };
 
-    if case_ids.is_empty() {
+    total_cases = cases.len();
+    if total_cases == 0 {
         let body = Json(TicketBatchResponse {
             status: "ok".to_string(),
             detail: "No se encontraron casos en el rango solicitado".to_string(),
@@ -112,17 +129,82 @@ async fn sync_tickets_by_range(
         return (StatusCode::OK, body).into_response();
     }
 
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let (cases, already_present) = match filter_pending_cases(&state, &db_name, cases).await {
+        Ok(result) => result,
+        Err(err) => {
+            let status = err.status_code();
+            let body = Json(TicketBatchResponse {
+                status: "error".to_string(),
+                detail: err.to_string(),
+                processed: 0,
+                successes: Vec::new(),
+                failures: Vec::new(),
+            });
+            return (status, body).into_response();
+        }
+    };
+
+    info!(
+        "Casos totales en rango: {} | Ya en MongoDB: {} | Pendientes: {}",
+        total_cases,
+        already_present,
+        cases.len()
+    );
+
+    if cases.is_empty() {
+        let body = Json(TicketBatchResponse {
+            status: "ok".to_string(),
+            detail: format!(
+                "Los {} casos encontrados ya estaban sincronizados en MongoDB",
+                total_cases
+            ),
+            processed: 0,
+            successes: Vec::new(),
+            failures: Vec::new(),
+        });
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let total_batches = (cases.len() + CASE_BATCH_SIZE - 1) / CASE_BATCH_SIZE;
+    info!(
+        "Se procesarán {} casos en {} lote(s) de hasta {} elementos",
+        cases.len(),
+        total_batches,
+        CASE_BATCH_SIZE
+    );
+
     let mut successes = Vec::new();
     let mut failures = Vec::new();
+    let mut iter = cases.into_iter();
+    let mut current_batch = 0usize;
 
-    for case_id in case_ids {
-        match sync_ticket_case(&state, &case_id).await {
-            Ok(_) => successes.push(case_id.clone()),
-            Err(err) => {
-                error!("Fallo al sincronizar ticket {}: {}", case_id, err);
-                failures.push(format!("{}: {}", case_id, err));
+    loop {
+        let batch: Vec<MysqlEmailRecord> = iter.by_ref().take(CASE_BATCH_SIZE).collect();
+        if batch.is_empty() {
+            break;
+        }
+
+        current_batch += 1;
+        info!(
+            "Iniciando lote {}/{} con {} caso(s)",
+            current_batch,
+            total_batches,
+            batch.len()
+        );
+
+        for record in batch {
+            let case_id = record.case_id.clone();
+            match sync_ticket_case(&state, record).await {
+                Ok(_) => successes.push(case_id),
+                Err(err) => {
+                    error!("Fallo al sincronizar ticket {}: {}", case_id, err);
+                    failures.push(format!("{}: {}", case_id, err));
+                }
             }
         }
+
+        info!("Lote {}/{} finalizado", current_batch, total_batches);
     }
 
     let processed = successes.len() + failures.len();
@@ -314,13 +396,14 @@ async fn sync_responses_by_range(
 
 async fn sync_ticket_case(
     state: &AppState,
-    case_id: &str,
+    mysql_record: MysqlEmailRecord,
 ) -> Result<TicketSyncResponse, TicketSyncError> {
+    let case_id = mysql_record.case_id.clone();
     let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
     let config_collection_name =
         env::var("MONGO_CONFIG_COLLECTION").unwrap_or_else(|_| "configuration".into());
 
-    if case_already_synced(state, &db_name, case_id).await? {
+    if case_already_synced(state, &db_name, &case_id).await? {
         return Ok(TicketSyncResponse {
             status: "skipped".to_string(),
             detail: format!("El caso {case_id} ya existe en MongoDB"),
@@ -330,8 +413,6 @@ async fn sync_ticket_case(
         });
     }
 
-    let mysql_record = fetch_mysql_record(state, case_id).await?;
-
     let config_email = mysql_record
         .config_email
         .clone()
@@ -339,7 +420,7 @@ async fn sync_ticket_case(
     let configuration_id =
         resolve_configuration_id(state, &db_name, &config_collection_name, &config_email).await?;
 
-    let sanitized_case = sanitize_segment(case_id);
+    let sanitized_case = sanitize_segment(&case_id);
     let remote_case_path = format!("{} {}", state.ssh_service.base_path(), case_id);
 
     let mut tasks = Vec::new();
@@ -355,39 +436,10 @@ async fn sync_ticket_case(
         return Err(TicketSyncError::CaseNotFound(case_id.to_string()));
     }
 
-    let mut uploaded_urls = Vec::new();
-    let mut mime_files = Vec::new();
-    let mut html_body = String::new();
+    let (uploaded_urls, mime_files, html_body) = process_case_file_tasks(state, tasks).await?;
 
-    for task in tasks {
-        let bytes = state
-            .ssh_service
-            .read_remote_file(&task.remote_path)
-            .await?;
-
-        if task.capture_main_html {
-            html_body = String::from_utf8(bytes.clone())
-                .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
-        }
-
-        state
-            .storage
-            .upload_object(&task.key, bytes.clone(), Some(&task.file_mime))
-            .await?;
-
-        let url = state.storage.object_url(&task.key);
-        uploaded_urls.push(url.clone());
-
-        mime_files.push(MsgMimeFile {
-            id: ObjectId::new().to_hex(),
-            file_image_html: task.file_mime.starts_with("image/")
-                || task.file_mime.contains("html"),
-            file_name: task.original_name.clone(),
-            file_type: task.file_mime.clone(),
-            file_size: task.file_size.to_string(),
-            file_url: url,
-            is_file_local: false,
-        });
+    if mime_files.is_empty() {
+        return Err(TicketSyncError::CaseNotFound(case_id.to_string()));
     }
 
     let mime_collection = state
@@ -395,11 +447,9 @@ async fn sync_ticket_case(
         .database(&db_name)
         .collection::<MsgMimeDocument>("msg-mime");
 
-    let html_content = if html_body.is_empty() {
-        mysql_record.subject.clone().unwrap_or_default()
-    } else {
-        html_body
-    };
+    let html_content = html_body
+        .filter(|content| !content.is_empty())
+        .unwrap_or_else(|| mysql_record.subject.clone().unwrap_or_default());
 
     let message_type = "entrada".to_string();
 
@@ -488,8 +538,38 @@ async fn sync_ticket_case(
 async fn fetch_case_ids_by_range(
     state: &AppState,
     bounds: &DateBounds,
-) -> Result<Vec<String>, TicketSyncError> {
-    fetch_distinct_case_ids(state, "correos_entrada", "Fecha_de_Registro", bounds).await
+) -> Result<Vec<MysqlEmailRecord>, TicketSyncError> {
+    fetch_case_records_by_range(state, bounds).await
+}
+
+async fn filter_pending_cases(
+    state: &AppState,
+    db_name: &str,
+    cases: Vec<MysqlEmailRecord>,
+) -> Result<(Vec<MysqlEmailRecord>, usize), TicketSyncError> {
+    if cases.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let collection = state
+        .mongo
+        .database(db_name)
+        .collection::<MsgStructDocument>("msg-struct");
+
+    let ids: Vec<String> = cases.iter().map(|case| case.case_id.clone()).collect();
+    let ids_bson: Vec<Bson> = ids.iter().map(|id| Bson::String(id.clone())).collect();
+    let filter = doc! { "num_caso": { "$in": ids_bson } };
+
+    let existing = collection.distinct("num_caso", filter).await?;
+    let existing_set: HashSet<String> = existing.into_iter().filter_map(bson_to_case_id).collect();
+
+    let pending: Vec<MysqlEmailRecord> = cases
+        .into_iter()
+        .filter(|case| !existing_set.contains(&case.case_id))
+        .collect();
+    let skipped = ids.len().saturating_sub(pending.len());
+
+    Ok((pending, skipped))
 }
 
 async fn fetch_note_case_ids(
@@ -775,58 +855,7 @@ async fn fetch_mysql_record(
         return Err(TicketSyncError::CaseNotFound(case_id.to_string()));
     };
 
-    let subject = get_any_string(&row, &["Asunto"]);
-    let from_email = get_any_string(&row, &["Correo_Entrada", "Correo"]);
-    let from_name = get_any_string(&row, &["Remitente", "Nombre_cliente", "Nombre_Cliente"]);
-    let to_emails = split_emails(get_any_string(&row, &["Correo_Destino", "Correos_To"]));
-    let cc_emails = split_emails(get_any_string(&row, &["Correos_CC"]));
-    let config_email = get_any_string(&row, &["Correo_Telcel"]);
-    let id_mail = row
-        .try_get("", "Id_Correo")
-        .ok()
-        .or_else(|| row.try_get("", "IdCorreo").ok());
-
-    let fechas_estatus =
-        get_any_string(&row, &["Fechas_estatus", "Fecha_Estatus", "Fechas_Estatus"]);
-    let nombre_cliente = get_any_string(&row, &["Nombre_cliente", "Nombre_Cliente"]);
-    let estatus = get_any_string(&row, &["Estatus"]);
-    let agente_asignado = get_any_string(&row, &["Agente_asignado", "Agente_Asignado"]);
-    let categoria = get_any_string(&row, &["Categoria"]);
-    let subcategoria = get_any_string(&row, &["Subcategoria", "Subcategoría", "SubCategoría"]);
-    let fecha_cerrada = get_any_string(&row, &["Fecha_cerrada", "Fecha_Cerrada"]);
-    let fecha_cliente = get_any_string(&row, &["Fecha_cliente", "Fecha_Cliente"]);
-    let numero_lineas = get_any_string(&row, &["Numero_lineas", "Numero_Lineas"]);
-    let lista_caso = get_any_string(&row, &["Lista_caso", "Lista_Caso"]);
-    let fecha_buzon = get_any_string(
-        &row,
-        &["Fecha_buzon", "Fecha_Buzon", "Fecha_Buzón", "Fecha_buzón"],
-    );
-    let fecha_de_registro = get_any_string(
-        &row,
-        &["Fecha_de_Registro", "Fecha_de_registro", "Fecha_Registro"],
-    );
-
-    Ok(MysqlEmailRecord {
-        subject,
-        from_email,
-        from_name,
-        to_emails,
-        cc_emails,
-        id_mail,
-        config_email,
-        fecha_buzon,
-        fechas_estatus,
-        nombre_cliente,
-        estatus,
-        agente_asignado,
-        categoria,
-        subcategoria,
-        fecha_cerrada,
-        fecha_cliente,
-        numero_lineas,
-        lista_caso,
-        fecha_de_registro,
-    })
+    Ok(build_mysql_record(&row, Some(case_id.to_string())))
 }
 
 async fn fetch_distinct_case_ids(
@@ -849,6 +878,29 @@ async fn fetch_distinct_case_ids(
         }
     }
     Ok(ids)
+}
+
+async fn fetch_case_records_by_range(
+    state: &AppState,
+    bounds: &DateBounds,
+) -> Result<Vec<MysqlEmailRecord>, TicketSyncError> {
+    let mut sql = "SELECT * FROM correos_entrada WHERE 1=1".to_string();
+    let mut values = Vec::new();
+    append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    sql.push_str(" ORDER BY Fecha_de_Registro ASC");
+
+    let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
+    let rows = state.mysql.query_all_raw(statement).await?;
+    let mut seen = HashSet::new();
+    let mut records = Vec::new();
+    for row in rows {
+        if let Some(case_id) = get_string(&row, "Num_Caso") {
+            if seen.insert(case_id.clone()) {
+                records.push(build_mysql_record(&row, Some(case_id)));
+            }
+        }
+    }
+    Ok(records)
 }
 
 async fn fetch_case_notes(
@@ -937,12 +989,8 @@ fn append_date_filters(
 ) {
     sql.push_str(&format!(" AND DATE({}) >= DATE(?)", column));
     values.push(bounds.start.clone().into());
-    if let Some(end) = &bounds.end {
-        sql.push_str(&format!(" AND DATE({}) <= DATE(?)", column));
-        values.push(end.clone().into());
-    } else {
-        sql.push_str(&format!(" AND DATE({}) <= CURDATE()", column));
-    }
+    sql.push_str(&format!(" AND DATE({}) <= DATE(?)", column));
+    values.push(bounds.end.clone().into());
 }
 
 async fn gather_case_files(
@@ -1109,6 +1157,70 @@ async fn gather_responses(
     Ok(())
 }
 
+async fn process_case_file_tasks(
+    state: &AppState,
+    tasks: Vec<FileTask>,
+) -> Result<(Vec<String>, Vec<MsgMimeFile>, Option<String>), TicketSyncError> {
+    if tasks.is_empty() {
+        return Ok((Vec::new(), Vec::new(), None));
+    }
+
+    let ssh_service = Arc::clone(&state.ssh_service);
+    let storage = Arc::clone(&state.storage);
+
+    let results = stream::iter(tasks.into_iter().map(|task| {
+        let ssh = Arc::clone(&ssh_service);
+        let storage = Arc::clone(&storage);
+
+        async move {
+            let bytes = ssh.read_remote_file(&task.remote_path).await?;
+            let html_body = if task.capture_main_html {
+                Some(
+                    String::from_utf8(bytes.clone())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned()),
+                )
+            } else {
+                None
+            };
+
+            storage
+                .upload_object(&task.key, bytes, Some(&task.file_mime))
+                .await?;
+
+            let url = storage.object_url(&task.key);
+            let mime_file = MsgMimeFile {
+                id: ObjectId::new().to_hex(),
+                file_image_html: task.file_mime.starts_with("image/")
+                    || task.file_mime.contains("html"),
+                file_name: task.original_name,
+                file_type: task.file_mime,
+                file_size: task.file_size.to_string(),
+                file_url: url.clone(),
+                is_file_local: false,
+            };
+
+            Ok::<_, TicketSyncError>((url, mime_file, html_body))
+        }
+    }))
+    .buffer_unordered(FILE_UPLOAD_CONCURRENCY)
+    .try_collect::<Vec<_>>()
+    .await?;
+
+    let mut uploaded_urls = Vec::with_capacity(results.len());
+    let mut mime_files = Vec::with_capacity(results.len());
+    let mut html_body = None;
+
+    for (url, file, html_candidate) in results {
+        if html_body.is_none() {
+            html_body = html_candidate;
+        }
+        uploaded_urls.push(url);
+        mime_files.push(file);
+    }
+
+    Ok((uploaded_urls, mime_files, html_body))
+}
+
 async fn resolve_configuration_id(
     state: &AppState,
     db_name: &str,
@@ -1244,7 +1356,25 @@ fn contacts_from_emails(emails: &[String]) -> Vec<MsgContact> {
         .collect()
 }
 
+fn bson_to_case_id(value: Bson) -> Option<String> {
+    match value {
+        Bson::String(value) => Some(value),
+        Bson::Int32(value) => Some(value.to_string()),
+        Bson::Int64(value) => Some(value.to_string()),
+        Bson::Double(value) => {
+            if (value.fract() - 0.0).abs() < f64::EPSILON {
+                Some(format!("{:.0}", value))
+            } else {
+                Some(value.to_string())
+            }
+        }
+        Bson::ObjectId(value) => Some(value.to_hex()),
+        _ => None,
+    }
+}
+
 struct MysqlEmailRecord {
+    case_id: String,
     subject: Option<String>,
     from_email: Option<String>,
     from_name: Option<String>,
@@ -1312,6 +1442,68 @@ fn split_emails(raw: Option<String>) -> Vec<String> {
 
 fn get_any_string(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<String> {
     columns.iter().find_map(|column| get_string(row, column))
+}
+
+fn build_mysql_record(
+    row: &sea_orm::QueryResult,
+    fallback_case_id: Option<String>,
+) -> MysqlEmailRecord {
+    let case_id = get_string(row, "Num_Caso")
+        .or(fallback_case_id)
+        .unwrap_or_default();
+    let subject = get_any_string(row, &["Asunto"]);
+    let from_email = get_any_string(row, &["Correo_Entrada", "Correo"]);
+    let from_name = get_any_string(row, &["Remitente", "Nombre_cliente", "Nombre_Cliente"]);
+    let to_emails = split_emails(get_any_string(row, &["Correo_Destino", "Correos_To"]));
+    let cc_emails = split_emails(get_any_string(row, &["Correos_CC"]));
+    let config_email = get_any_string(row, &["Correo_Telcel"]);
+    let id_mail = row
+        .try_get("", "Id_Correo")
+        .ok()
+        .or_else(|| row.try_get("", "IdCorreo").ok());
+
+    let fechas_estatus =
+        get_any_string(row, &["Fechas_estatus", "Fecha_Estatus", "Fechas_Estatus"]);
+    let nombre_cliente = get_any_string(row, &["Nombre_cliente", "Nombre_Cliente"]);
+    let estatus = get_any_string(row, &["Estatus"]);
+    let agente_asignado = get_any_string(row, &["Agente_asignado", "Agente_Asignado"]);
+    let categoria = get_any_string(row, &["Categoria"]);
+    let subcategoria = get_any_string(row, &["Subcategoria", "Subcategoría", "SubCategoría"]);
+    let fecha_cerrada = get_any_string(row, &["Fecha_cerrada", "Fecha_Cerrada"]);
+    let fecha_cliente = get_any_string(row, &["Fecha_cliente", "Fecha_Cliente"]);
+    let numero_lineas = get_any_string(row, &["Numero_lineas", "Numero_Lineas"]);
+    let lista_caso = get_any_string(row, &["Lista_caso", "Lista_Caso"]);
+    let fecha_buzon = get_any_string(
+        row,
+        &["Fecha_buzon", "Fecha_Buzon", "Fecha_Buzón", "Fecha_buzón"],
+    );
+    let fecha_de_registro = get_any_string(
+        row,
+        &["Fecha_de_Registro", "Fecha_de_registro", "Fecha_Registro"],
+    );
+
+    MysqlEmailRecord {
+        case_id,
+        subject,
+        from_email,
+        from_name,
+        to_emails,
+        cc_emails,
+        id_mail,
+        config_email,
+        fecha_buzon,
+        fechas_estatus,
+        nombre_cliente,
+        estatus,
+        agente_asignado,
+        categoria,
+        subcategoria,
+        fecha_cerrada,
+        fecha_cliente,
+        numero_lineas,
+        lista_caso,
+        fecha_de_registro,
+    }
 }
 
 fn parse_mysql_datetime(raw: Option<&str>) -> Option<mongodb::bson::DateTime> {

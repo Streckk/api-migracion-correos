@@ -47,7 +47,6 @@ impl SshService {
 
     pub async fn list_remote_dir(&self, path: &str) -> SshResult<Vec<RemoteDirEntry>> {
         let resolved = self.resolved_path(path);
-        tracing::info!(target = "ssh", requested = %path, resolved = %resolved, "Consultando directorio remoto");
         let connection = self.client.connect(&self.config).await?;
         self.client.list_dir(&connection, &resolved).await
     }
