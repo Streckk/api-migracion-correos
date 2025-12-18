@@ -22,6 +22,12 @@ pub struct StorageService {
     base_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct StoredObject {
+    pub key: String,
+    pub size: i64,
+}
+
 impl StorageService {
     pub fn from_env() -> Result<Self, StorageError> {
         let bucket = env::var("S3_BUCKET")
@@ -92,5 +98,65 @@ impl StorageService {
 
     pub fn object_url(&self, key: &str) -> String {
         format!("{}/{}", self.base_url.trim_end_matches('/'), key)
+    }
+
+    pub async fn get_object(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|err| StorageError::Client(err.to_string()))?;
+
+        let data = response
+            .body
+            .collect()
+            .await
+            .map_err(|err| StorageError::Client(err.to_string()))?;
+
+        Ok(data.into_bytes().to_vec())
+    }
+
+    pub async fn list_objects(&self, prefix: &str) -> Result<Vec<StoredObject>, StorageError> {
+        let mut continuation = None;
+        let mut objects = Vec::new();
+
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+
+            if let Some(token) = &continuation {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|err| StorageError::Client(err.to_string()))?;
+
+            if let Some(contents) = response.contents {
+                for object in contents {
+                    if let Some(key) = object.key {
+                        objects.push(StoredObject {
+                            key,
+                            size: object.size.unwrap_or(0),
+                        });
+                    }
+                }
+            }
+
+            if response.next_continuation_token.is_none() {
+                break;
+            }
+
+            continuation = response.next_continuation_token;
+        }
+
+        Ok(objects)
     }
 }

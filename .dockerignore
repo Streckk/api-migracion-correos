@@ -1,0 +1,9 @@
+target
+Dockerfile
+.git
+.gitignore
+.env
+.env.*
+*.log
+ssh_integration.md
+**/.DS_Store

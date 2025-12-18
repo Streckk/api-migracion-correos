@@ -16,13 +16,7 @@ pub struct ConnectionConfig {
 
 #[derive(Debug, Clone)]
 pub enum AuthMethod {
-    Password {
-        password: String,
-    },
-    KeyPath {
-        private_key_path: String,
-        passphrase: Option<String>,
-    },
+    Password { password: String },
 }
 
 #[derive(Debug, Clone, Serialize)]

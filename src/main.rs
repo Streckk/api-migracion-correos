@@ -1,14 +1,19 @@
 use mongodb::Client as MongoClient;
 use sea_orm::Database;
-use std::{env, net::SocketAddr};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod auth;
 mod entities;
 mod routes;
 mod ssh;
 mod state;
 mod storage;
 
+use axum::{middleware, Router};
 use state::AppState;
 
 #[tokio::main]
@@ -32,17 +37,30 @@ async fn main() {
 
     let state = AppState::new(mysql, mongo);
 
-    let app = routes::router().with_state(state);
+    let auth_layer = middleware::from_fn_with_state(state.clone(), auth::require_token);
+
+    let protected_routes = routes::protected_router().layer(auth_layer);
+    let app = Router::new()
+        .merge(routes::public_router())
+        .merge(protected_routes)
+        .with_state(state);
 
     let port = env::var("PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3000);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let host = env::var("IP_SERVER")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
+
+    let addr = SocketAddr::new(host, port);
 
     println!("API corriendo en http://{}/health", addr);
 
-    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
 }

@@ -10,9 +10,12 @@ pub mod sync;
 
 use crate::state::AppState;
 
-pub fn router() -> Router<AppState> {
+pub fn public_router() -> Router<AppState> {
+    Router::new().merge(health::router())
+}
+
+pub fn protected_router() -> Router<AppState> {
     Router::new()
-        .merge(health::router())
         .merge(mysql::router())
         .merge(mongo::router())
         .merge(storage::router())

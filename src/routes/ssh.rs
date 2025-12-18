@@ -172,7 +172,6 @@ fn fallback_numeric_ticket_path(state: &AppState, request_path: &str) -> Option<
 }
 fn ssh_error_response(err: SshError) -> Response {
     let status = match err {
-        SshError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
         SshError::AuthenticationFailed => StatusCode::UNAUTHORIZED,
         SshError::HostKeyUnknown { .. } | SshError::HostKeyMismatch { .. } => {
             StatusCode::BAD_GATEWAY
