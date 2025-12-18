@@ -1,6 +1,9 @@
 use mongodb::Client as MongoClient;
 use sea_orm::Database;
-use std::{env, net::SocketAddr};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod auth;
@@ -46,7 +49,13 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3000);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    let host = env::var("IP_SERVER")
+        .ok()
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
+
+    let addr = SocketAddr::new(host, port);
 
     println!("API corriendo en http://{}/health", addr);
 
