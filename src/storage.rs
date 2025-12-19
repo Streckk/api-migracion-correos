@@ -3,6 +3,7 @@ use std::env;
 use aws_sdk_s3::{
     config::{BehaviorVersion, Credentials, Region},
     primitives::ByteStream,
+    types::ObjectCannedAcl,
     Client,
 };
 use thiserror::Error;
@@ -82,7 +83,8 @@ impl StorageService {
             .put_object()
             .bucket(&self.bucket)
             .key(key)
-            .body(ByteStream::from(contents));
+            .body(ByteStream::from(contents))
+            .acl(ObjectCannedAcl::PublicRead);
 
         if let Some(kind) = content_type {
             request = request.content_type(kind);
