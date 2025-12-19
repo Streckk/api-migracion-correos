@@ -7,7 +7,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDate, NaiveDateTime};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use mime_guess::MimeGuess;
 use mongodb::bson::{doc, oid::ObjectId, Bson};
@@ -28,8 +28,33 @@ use crate::{
     storage::StorageError,
 };
 
-const CASE_BATCH_SIZE: usize = 10;
-const FILE_UPLOAD_CONCURRENCY: usize = 4;
+const DEFAULT_CASE_BATCH_SIZE: usize = 10;
+const DEFAULT_CASE_PARALLELISM: usize = 2;
+const DEFAULT_FILE_UPLOAD_CONCURRENCY: usize = 4;
+
+fn case_batch_size() -> usize {
+    env::var("CASE_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CASE_BATCH_SIZE)
+}
+
+fn case_parallelism() -> usize {
+    env::var("CASE_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_CASE_PARALLELISM)
+}
+
+fn file_upload_concurrency() -> usize {
+    env::var("FILE_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_FILE_UPLOAD_CONCURRENCY)
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -54,36 +79,33 @@ impl DateRangeQuery {
         let start = self
             .fecha_inicio
             .as_ref()
-            .map(|value| extract_date(value))?;
+            .and_then(|value| parse_date_only(value))?;
         let end = self
             .fecha_fin
             .as_ref()
-            .map(|value| extract_date(value))
-            .unwrap_or_else(|| current_date_string());
+            .and_then(|value| parse_date_only(value))
+            .unwrap_or_else(current_date);
         Some(DateBounds { start, end })
     }
 }
 
 #[derive(Clone)]
 struct DateBounds {
-    start: String,
-    end: String,
+    start: NaiveDate,
+    end: NaiveDate,
 }
 
-fn current_date_string() -> String {
-    chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string()
+fn current_date() -> NaiveDate {
+    chrono::Local::now().date_naive()
 }
 
-fn extract_date(value: &str) -> String {
-    value
+fn parse_date_only(value: &str) -> Option<NaiveDate> {
+    let part = value
         .split(|c| c == ' ' || c == 'T')
         .next()
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_string())
-        .unwrap_or_else(|| value.to_string())
+        .unwrap_or(value)
+        .trim();
+    NaiveDate::parse_from_str(part, "%Y-%m-%d").ok()
 }
 
 async fn sync_tickets_by_range(
@@ -166,12 +188,13 @@ async fn sync_tickets_by_range(
         return (StatusCode::OK, body).into_response();
     }
 
-    let total_batches = (cases.len() + CASE_BATCH_SIZE - 1) / CASE_BATCH_SIZE;
+    let batch_size = case_batch_size();
+    let total_batches = (cases.len() + batch_size - 1) / batch_size;
     info!(
         "Se procesarán {} casos en {} lote(s) de hasta {} elementos",
         cases.len(),
         total_batches,
-        CASE_BATCH_SIZE
+        batch_size
     );
 
     let mut successes = Vec::new();
@@ -180,7 +203,7 @@ async fn sync_tickets_by_range(
     let mut current_batch = 0usize;
 
     loop {
-        let batch: Vec<MysqlEmailRecord> = iter.by_ref().take(CASE_BATCH_SIZE).collect();
+        let batch: Vec<MysqlEmailRecord> = iter.by_ref().take(batch_size).collect();
         if batch.is_empty() {
             break;
         }
@@ -193,11 +216,25 @@ async fn sync_tickets_by_range(
             batch.len()
         );
 
-        for record in batch {
-            let case_id = record.case_id.clone();
-            match sync_ticket_case(&state, record).await {
-                Ok(_) => successes.push(case_id),
-                Err(err) => {
+        let case_parallel = case_parallelism();
+        let results = stream::iter(batch.into_iter().map(|record| {
+            let state = state.clone();
+            async move {
+                let case_id = record.case_id.clone();
+                match sync_ticket_case(&state, record).await {
+                    Ok(_) => Ok(case_id),
+                    Err(err) => Err((case_id, err)),
+                }
+            }
+        }))
+        .buffer_unordered(case_parallel)
+        .collect::<Vec<_>>()
+        .await;
+
+        for result in results {
+            match result {
+                Ok(case_id) => successes.push(case_id),
+                Err((case_id, err)) => {
                     error!("Fallo al sincronizar ticket {}: {}", case_id, err);
                     failures.push(format!("{}: {}", case_id, err));
                 }
@@ -540,7 +577,7 @@ async fn fetch_case_ids_by_range(
     bounds: &DateBounds,
 ) -> Result<Vec<MysqlEmailRecord>, TicketSyncError> {
     fetch_case_records_by_range(state, bounds).await
-}
+}   
 
 async fn filter_pending_cases(
     state: &AppState,
@@ -987,10 +1024,22 @@ fn append_date_filters(
     column: &str,
     bounds: &DateBounds,
 ) {
-    sql.push_str(&format!(" AND DATE({}) >= DATE(?)", column));
-    values.push(bounds.start.clone().into());
-    sql.push_str(&format!(" AND DATE({}) <= DATE(?)", column));
-    values.push(bounds.end.clone().into());
+    sql.push_str(&format!(" AND {} >= ?", column));
+    let start_dt = bounds
+        .start
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_else(|| bounds.start.and_hms_milli_opt(0, 0, 0, 0).unwrap());
+    values.push(start_dt.to_string().into());
+
+    let end_exclusive = bounds
+        .end
+        .checked_add_signed(Duration::days(1))
+        .unwrap_or(bounds.end);
+    let end_dt = end_exclusive
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_else(|| end_exclusive.and_hms_milli_opt(0, 0, 0, 0).unwrap());
+    sql.push_str(&format!(" AND {} < ?", column));
+    values.push(end_dt.to_string().into());
 }
 
 async fn gather_case_files(
@@ -1168,6 +1217,8 @@ async fn process_case_file_tasks(
     let ssh_service = Arc::clone(&state.ssh_service);
     let storage = Arc::clone(&state.storage);
 
+    let upload_concurrency = file_upload_concurrency();
+
     let results = stream::iter(tasks.into_iter().map(|task| {
         let ssh = Arc::clone(&ssh_service);
         let storage = Arc::clone(&storage);
@@ -1202,7 +1253,7 @@ async fn process_case_file_tasks(
             Ok::<_, TicketSyncError>((url, mime_file, html_body))
         }
     }))
-    .buffer_unordered(FILE_UPLOAD_CONCURRENCY)
+    .buffer_unordered(upload_concurrency)
     .try_collect::<Vec<_>>()
     .await?;
 

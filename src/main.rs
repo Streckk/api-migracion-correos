@@ -50,12 +50,7 @@ async fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(3000);
 
-    let host = env::var("IP_SERVER")
-        .ok()
-        .and_then(|value| value.parse::<IpAddr>().ok())
-        .unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
-
-    let addr = SocketAddr::new(host, port);
+    let addr = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port);
 
     println!("API corriendo en http://{}/health", addr);
 
