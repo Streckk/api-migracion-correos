@@ -72,6 +72,8 @@ struct DateRangeQuery {
     fecha_inicio: Option<String>,
     #[serde(default)]
     fecha_fin: Option<String>,
+    #[serde(default)]
+    num_caso: Option<String>,
 }
 
 impl DateRangeQuery {
@@ -270,36 +272,66 @@ async fn sync_notes_by_range(
     State(state): State<AppState>,
     Query(range): Query<DateRangeQuery>,
 ) -> Response {
-    let Some(bounds) = range.resolved_bounds() else {
-        let body = Json(MessageSyncResponse {
-            status: "error".to_string(),
-            detail: "Debes proporcionar al menos fecha_inicio".to_string(),
-            inserted: 0,
-            mime_ids: Vec::new(),
-            msg_struct_ids: Vec::new(),
-        });
-        return (StatusCode::BAD_REQUEST, body).into_response();
-    };
+    let case_override = range
+        .num_caso
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
 
-    let case_ids = match fetch_note_case_ids(&state, &bounds).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            let status = err.status_code();
+    let (bounds, case_ids) = if let Some(case_id) = case_override.clone() {
+        info!("Notas - Modo num_caso activo: {}", case_id);
+        (None, vec![case_id])
+    } else {
+        let Some(bounds) = range.resolved_bounds() else {
             let body = Json(MessageSyncResponse {
                 status: "error".to_string(),
-                detail: err.to_string(),
+                detail: "Debes proporcionar al menos fecha_inicio o num_caso".to_string(),
                 inserted: 0,
                 mime_ids: Vec::new(),
                 msg_struct_ids: Vec::new(),
             });
-            return (status, body).into_response();
-        }
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        };
+
+        let case_ids = match fetch_note_case_ids(&state, &bounds).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                let status = err.status_code();
+                let body = Json(MessageSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    inserted: 0,
+                    mime_ids: Vec::new(),
+                    msg_struct_ids: Vec::new(),
+                });
+                return (status, body).into_response();
+            }
+        };
+
+        info!(
+            "Notas - Modo rango activo: {} a {} (casos {})",
+            bounds.start,
+            bounds.end,
+            case_ids.len()
+        );
+        (Some(bounds), case_ids)
     };
 
+    info!(
+        "Notas - Casos antes de filtrar en MongoDB: {}",
+        case_ids.len()
+    );
+
     if case_ids.is_empty() {
+        let detail = if let Some(case_id) = case_override {
+            format!("No se encontraron notas para el caso {}", case_id)
+        } else {
+            "No se encontraron notas en el rango solicitado".to_string()
+        };
         let body = Json(MessageSyncResponse {
             status: "ok".to_string(),
-            detail: "No se encontraron notas en el rango solicitado".to_string(),
+            detail,
             inserted: 0,
             mime_ids: Vec::new(),
             msg_struct_ids: Vec::new(),
@@ -307,23 +339,102 @@ async fn sync_notes_by_range(
         return (StatusCode::OK, body).into_response();
     }
 
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let (case_ids, already_present) =
+        match filter_pending_case_ids_by_type(&state, &db_name, case_ids, "nota").await {
+            Ok(result) => result,
+            Err(err) => {
+                let status = err.status_code();
+                let body = Json(MessageSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    inserted: 0,
+                    mime_ids: Vec::new(),
+                    msg_struct_ids: Vec::new(),
+                });
+                return (status, body).into_response();
+            }
+        };
+
+    info!(
+        "Notas - Casos totales: {} | Ya en MongoDB: {} | Pendientes: {}",
+        case_ids.len() + already_present,
+        already_present,
+        case_ids.len()
+    );
+
+    if case_ids.is_empty() {
+        let body = Json(MessageSyncResponse {
+            status: "ok".to_string(),
+            detail: "Todos los casos de notas ya existen en MongoDB".to_string(),
+            inserted: 0,
+            mime_ids: Vec::new(),
+            msg_struct_ids: Vec::new(),
+        });
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let batch_size = case_batch_size();
+    let total_batches = (case_ids.len() + batch_size - 1) / batch_size;
+    info!(
+        "Notas - Se procesarán {} casos en {} lote(s) de hasta {} elementos",
+        case_ids.len(),
+        total_batches,
+        batch_size
+    );
+
     let mut total_inserted = 0;
     let mut mime_ids = Vec::new();
     let mut msg_struct_ids = Vec::new();
     let mut failures = Vec::new();
+    let mut iter = case_ids.into_iter();
+    let mut current_batch = 0usize;
 
-    for case_id in case_ids {
-        match sync_notes_for_case(&state, &case_id, &bounds).await {
-            Ok(summary) => {
-                total_inserted += summary.inserted;
-                mime_ids.extend(summary.mime_ids);
-                msg_struct_ids.extend(summary.msg_struct_ids);
+    loop {
+        let batch: Vec<String> = iter.by_ref().take(batch_size).collect();
+        if batch.is_empty() {
+            break;
+        }
+
+        current_batch += 1;
+        info!(
+            "Notas - Iniciando lote {}/{} con {} caso(s)",
+            current_batch,
+            total_batches,
+            batch.len()
+        );
+
+        let case_parallel = case_parallelism();
+        let results = stream::iter(batch.into_iter().map(|case_id| {
+            let state = state.clone();
+            let bounds = bounds.as_ref();
+            async move {
+                let result = sync_notes_for_case(&state, &case_id, bounds).await;
+                (case_id, result)
             }
-            Err(err) => {
-                error!("Fallo al sincronizar notas del ticket {}: {}", case_id, err);
-                failures.push(format!("{}: {}", case_id, err));
+        }))
+        .buffer_unordered(case_parallel)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (case_id, result) in results {
+            match result {
+                Ok(summary) => {
+                    total_inserted += summary.inserted;
+                    mime_ids.extend(summary.mime_ids);
+                    msg_struct_ids.extend(summary.msg_struct_ids);
+                }
+                Err(err) => {
+                    error!("Fallo al sincronizar notas del ticket {}: {}", case_id, err);
+                    failures.push(format!("{}: {}", case_id, err));
+                }
             }
         }
+
+        info!(
+            "Notas - Lote {}/{} finalizado",
+            current_batch, total_batches
+        );
     }
 
     let status = if failures.is_empty() { "ok" } else { "partial" };
@@ -351,36 +462,66 @@ async fn sync_responses_by_range(
     State(state): State<AppState>,
     Query(range): Query<DateRangeQuery>,
 ) -> Response {
-    let Some(bounds) = range.resolved_bounds() else {
-        let body = Json(MessageSyncResponse {
-            status: "error".to_string(),
-            detail: "Debes proporcionar al menos fecha_inicio".to_string(),
-            inserted: 0,
-            mime_ids: Vec::new(),
-            msg_struct_ids: Vec::new(),
-        });
-        return (StatusCode::BAD_REQUEST, body).into_response();
-    };
+    let case_override = range
+        .num_caso
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
 
-    let case_ids = match fetch_response_case_ids(&state, &bounds).await {
-        Ok(ids) => ids,
-        Err(err) => {
-            let status = err.status_code();
+    let (bounds, case_ids) = if let Some(case_id) = case_override.clone() {
+        info!("Respuestas - Modo num_caso activo: {}", case_id);
+        (None, vec![case_id])
+    } else {
+        let Some(bounds) = range.resolved_bounds() else {
             let body = Json(MessageSyncResponse {
                 status: "error".to_string(),
-                detail: err.to_string(),
+                detail: "Debes proporcionar al menos fecha_inicio o num_caso".to_string(),
                 inserted: 0,
                 mime_ids: Vec::new(),
                 msg_struct_ids: Vec::new(),
             });
-            return (status, body).into_response();
-        }
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        };
+
+        let case_ids = match fetch_response_case_ids(&state, &bounds).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                let status = err.status_code();
+                let body = Json(MessageSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    inserted: 0,
+                    mime_ids: Vec::new(),
+                    msg_struct_ids: Vec::new(),
+                });
+                return (status, body).into_response();
+            }
+        };
+
+        info!(
+            "Respuestas - Modo rango activo: {} a {} (casos {})",
+            bounds.start,
+            bounds.end,
+            case_ids.len()
+        );
+        (Some(bounds), case_ids)
     };
 
+    info!(
+        "Respuestas - Casos antes de filtrar en MongoDB: {}",
+        case_ids.len()
+    );
+
     if case_ids.is_empty() {
+        let detail = if let Some(case_id) = case_override {
+            format!("No se encontraron respuestas para el caso {}", case_id)
+        } else {
+            "No se encontraron respuestas en el rango solicitado".to_string()
+        };
         let body = Json(MessageSyncResponse {
             status: "ok".to_string(),
-            detail: "No se encontraron respuestas en el rango solicitado".to_string(),
+            detail,
             inserted: 0,
             mime_ids: Vec::new(),
             msg_struct_ids: Vec::new(),
@@ -388,26 +529,105 @@ async fn sync_responses_by_range(
         return (StatusCode::OK, body).into_response();
     }
 
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let (case_ids, already_present) =
+        match filter_pending_case_ids_by_type(&state, &db_name, case_ids, "respuesta").await {
+            Ok(result) => result,
+            Err(err) => {
+                let status = err.status_code();
+                let body = Json(MessageSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    inserted: 0,
+                    mime_ids: Vec::new(),
+                    msg_struct_ids: Vec::new(),
+                });
+                return (status, body).into_response();
+            }
+        };
+
+    info!(
+        "Respuestas - Casos totales: {} | Ya en MongoDB: {} | Pendientes: {}",
+        case_ids.len() + already_present,
+        already_present,
+        case_ids.len()
+    );
+
+    if case_ids.is_empty() {
+        let body = Json(MessageSyncResponse {
+            status: "ok".to_string(),
+            detail: "Todos los casos de respuestas ya existen en MongoDB".to_string(),
+            inserted: 0,
+            mime_ids: Vec::new(),
+            msg_struct_ids: Vec::new(),
+        });
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let batch_size = case_batch_size();
+    let total_batches = (case_ids.len() + batch_size - 1) / batch_size;
+    info!(
+        "Respuestas - Se procesarán {} casos en {} lote(s) de hasta {} elementos",
+        case_ids.len(),
+        total_batches,
+        batch_size
+    );
+
     let mut total_inserted = 0;
     let mut mime_ids = Vec::new();
     let mut msg_struct_ids = Vec::new();
     let mut failures = Vec::new();
+    let mut iter = case_ids.into_iter();
+    let mut current_batch = 0usize;
 
-    for case_id in case_ids {
-        match sync_responses_for_case(&state, &case_id, &bounds).await {
-            Ok(summary) => {
-                total_inserted += summary.inserted;
-                mime_ids.extend(summary.mime_ids);
-                msg_struct_ids.extend(summary.msg_struct_ids);
+    loop {
+        let batch: Vec<String> = iter.by_ref().take(batch_size).collect();
+        if batch.is_empty() {
+            break;
+        }
+
+        current_batch += 1;
+        info!(
+            "Respuestas - Iniciando lote {}/{} con {} caso(s)",
+            current_batch,
+            total_batches,
+            batch.len()
+        );
+
+        let case_parallel = case_parallelism();
+        let results = stream::iter(batch.into_iter().map(|case_id| {
+            let state = state.clone();
+            let bounds = bounds.as_ref();
+            async move {
+                let result = sync_responses_for_case(&state, &case_id, bounds).await;
+                (case_id, result)
             }
-            Err(err) => {
-                error!(
-                    "Fallo al sincronizar respuestas del ticket {}: {}",
-                    case_id, err
-                );
-                failures.push(format!("{}: {}", case_id, err));
+        }))
+        .buffer_unordered(case_parallel)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (case_id, result) in results {
+            match result {
+                Ok(summary) => {
+                    total_inserted += summary.inserted;
+                    mime_ids.extend(summary.mime_ids);
+                    msg_struct_ids.extend(summary.msg_struct_ids);
+                }
+                Err(err) => {
+                    error!(
+                        "Fallo al sincronizar respuestas del ticket {}: {}",
+                        case_id, err
+                    );
+                    failures.push(format!("{}: {}", case_id, err));
+                }
             }
         }
+
+        info!(
+            "Respuestas - Lote {}/{} finalizado",
+            current_batch, total_batches
+        );
     }
 
     let status = if failures.is_empty() { "ok" } else { "partial" };
@@ -577,7 +797,7 @@ async fn fetch_case_ids_by_range(
     bounds: &DateBounds,
 ) -> Result<Vec<MysqlEmailRecord>, TicketSyncError> {
     fetch_case_records_by_range(state, bounds).await
-}   
+}
 
 async fn filter_pending_cases(
     state: &AppState,
@@ -609,6 +829,36 @@ async fn filter_pending_cases(
     Ok((pending, skipped))
 }
 
+async fn filter_pending_case_ids_by_type(
+    state: &AppState,
+    db_name: &str,
+    case_ids: Vec<String>,
+    message_type: &str,
+) -> Result<(Vec<String>, usize), TicketSyncError> {
+    if case_ids.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let collection = state
+        .mongo
+        .database(db_name)
+        .collection::<MsgStructDocument>("msg-struct");
+
+    let ids_bson: Vec<Bson> = case_ids.iter().map(|id| Bson::String(id.clone())).collect();
+    let filter = doc! { "num_caso": { "$in": ids_bson }, "message_type": message_type };
+
+    let existing = collection.distinct("num_caso", filter).await?;
+    let existing_set: HashSet<String> = existing.into_iter().filter_map(bson_to_case_id).collect();
+
+    let pending: Vec<String> = case_ids
+        .into_iter()
+        .filter(|case_id| !existing_set.contains(case_id))
+        .collect();
+    let skipped = existing_set.len();
+
+    Ok((pending, skipped))
+}
+
 async fn fetch_note_case_ids(
     state: &AppState,
     bounds: &DateBounds,
@@ -626,22 +876,12 @@ async fn fetch_response_case_ids(
 async fn sync_notes_for_case(
     state: &AppState,
     case_id: &str,
-    bounds: &DateBounds,
+    bounds: Option<&DateBounds>,
 ) -> Result<MessageSyncResponse, TicketSyncError> {
     let mysql_record = fetch_mysql_record(state, case_id).await?;
     let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
     let config_collection_name =
         env::var("MONGO_CONFIG_COLLECTION").unwrap_or_else(|_| "configuration".into());
-
-    if case_already_synced(state, &db_name, case_id).await? {
-        return Ok(MessageSyncResponse {
-            status: "skipped".to_string(),
-            detail: format!("El caso {case_id} ya existe en MongoDB"),
-            inserted: 0,
-            mime_ids: Vec::new(),
-            msg_struct_ids: Vec::new(),
-        });
-    }
 
     let config_email = mysql_record
         .config_email
@@ -650,7 +890,19 @@ async fn sync_notes_for_case(
     let configuration_id =
         resolve_configuration_id(state, &db_name, &config_collection_name, &config_email).await?;
 
+    let db = state.mongo.database(&db_name);
+    let mime_collection = db.collection::<MsgMimeDocument>("msg-mime");
+    let struct_collection = db.collection::<MsgStructDocument>("msg-struct");
+
     let notes = fetch_case_notes(state, case_id, bounds).await?;
+    info!(
+        "Notas caso {}: {} registro(s) encontrados en MySQL{}",
+        case_id,
+        notes.len(),
+        bounds
+            .map(|value| format!(" (rango {} -> {})", value.start, value.end))
+            .unwrap_or_else(|| " (sin rango)".to_string())
+    );
     if notes.is_empty() {
         return Ok(MessageSyncResponse {
             status: "ok".to_string(),
@@ -660,19 +912,14 @@ async fn sync_notes_for_case(
             msg_struct_ids: Vec::new(),
         });
     }
-
-    let db = state.mongo.database(&db_name);
-    let mime_collection = db.collection::<MsgMimeDocument>("msg-mime");
-    let struct_collection = db.collection::<MsgStructDocument>("msg-struct");
     let sanitized_case = sanitize_segment(case_id);
     let base_prefix = format!("tickets/{}", sanitized_case);
 
     let mut inserted_mime_ids = Vec::new();
     let mut inserted_struct_ids = Vec::new();
-
     for note in notes {
         if struct_collection
-            .find_one(doc! { "id_mail": note.id })
+            .find_one(doc! { "id_mail": note.id, "message_type": "nota", "num_caso": case_id })
             .await?
             .is_some()
         {
@@ -739,6 +986,10 @@ async fn sync_notes_for_case(
     }
 
     let inserted = inserted_struct_ids.len();
+    info!(
+        "Notas caso {}: total {} | insertadas {}",
+        case_id, inserted, inserted
+    );
     Ok(MessageSyncResponse {
         status: "ok".to_string(),
         detail: format!("Se migraron {} notas para el caso {}", inserted, case_id),
@@ -751,22 +1002,12 @@ async fn sync_notes_for_case(
 async fn sync_responses_for_case(
     state: &AppState,
     case_id: &str,
-    bounds: &DateBounds,
+    bounds: Option<&DateBounds>,
 ) -> Result<MessageSyncResponse, TicketSyncError> {
     let mysql_record = fetch_mysql_record(state, case_id).await?;
     let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
     let config_collection_name =
         env::var("MONGO_CONFIG_COLLECTION").unwrap_or_else(|_| "configuration".into());
-
-    if case_already_synced(state, &db_name, case_id).await? {
-        return Ok(MessageSyncResponse {
-            status: "skipped".to_string(),
-            detail: format!("El caso {case_id} ya existe en MongoDB"),
-            inserted: 0,
-            mime_ids: Vec::new(),
-            msg_struct_ids: Vec::new(),
-        });
-    }
 
     let config_email = mysql_record
         .config_email
@@ -794,10 +1035,15 @@ async fn sync_responses_for_case(
 
     let mut inserted_mime_ids = Vec::new();
     let mut inserted_struct_ids = Vec::new();
+    let mut skipped = 0usize;
 
     for response in responses {
         if struct_collection
-            .find_one(doc! { "id_mail": response.id })
+            .find_one(doc! {
+                "id_mail": response.id,
+                "message_type": "respuesta",
+                "num_caso": case_id
+            })
             .await?
             .is_some()
         {
@@ -805,6 +1051,7 @@ async fn sync_responses_for_case(
                 "Respuesta {} del caso {} ya existe en MongoDB, se omite",
                 response.id, case_id
             );
+            skipped += 1;
             continue;
         }
 
@@ -865,6 +1112,13 @@ async fn sync_responses_for_case(
     }
 
     let inserted = inserted_struct_ids.len();
+    info!(
+        "Respuestas caso {}: total {} | insertadas {} | omitidas {}",
+        case_id,
+        inserted + skipped,
+        inserted,
+        skipped
+    );
     Ok(MessageSyncResponse {
         status: "ok".to_string(),
         detail: format!(
@@ -943,13 +1197,15 @@ async fn fetch_case_records_by_range(
 async fn fetch_case_notes(
     state: &AppState,
     case_id: &str,
-    bounds: &DateBounds,
+    bounds: Option<&DateBounds>,
 ) -> Result<Vec<MysqlNoteRecord>, TicketSyncError> {
     let mut sql =
         "SELECT Id, Num_Caso, Usuario, Fecha_de_Registro FROM correos_notas WHERE Num_Caso = ?"
             .to_string();
     let mut values = vec![case_id.to_string().into()];
-    append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    if let Some(bounds) = bounds {
+        append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    }
     sql.push_str(" ORDER BY Fecha_de_Registro ASC");
 
     let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
@@ -974,11 +1230,13 @@ async fn fetch_case_notes(
 async fn fetch_case_responses(
     state: &AppState,
     case_id: &str,
-    bounds: &DateBounds,
+    bounds: Option<&DateBounds>,
 ) -> Result<Vec<MysqlResponseRecord>, TicketSyncError> {
     let mut sql = "SELECT * FROM correos_respuesta WHERE Num_Caso = ?".to_string();
     let mut values = vec![case_id.to_string().into()];
-    append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    if let Some(bounds) = bounds {
+        append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    }
     sql.push_str(" ORDER BY Fecha_de_Registro ASC");
 
     let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
