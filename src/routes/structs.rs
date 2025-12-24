@@ -61,6 +61,19 @@ pub struct MessageSyncResponse {
 }
 
 #[derive(Serialize)]
+pub struct UserSyncResponse {
+    pub status: String,
+    pub detail: String,
+    pub processed: usize,
+    pub inserted: usize,
+    pub skipped: usize,
+    pub errors: usize,
+    pub skipped_missing_reference: usize,
+    pub skipped_duplicate: usize,
+    pub missing_references: Vec<String>,
+}
+
+#[derive(Serialize)]
 pub struct MongoCheckResponse {
     pub status: String,
     pub detail: String,

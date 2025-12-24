@@ -1,4 +1,8 @@
-use std::{collections::HashSet, env, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::Arc,
+};
 
 use axum::{
     extract::{Query, State},
@@ -7,10 +11,10 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use chrono::{Duration, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use mime_guess::MimeGuess;
-use mongodb::bson::{doc, oid::ObjectId, Bson};
+use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use serde::Deserialize;
 use tracing::{error, info, warn};
@@ -20,8 +24,12 @@ use crate::{
         email_config::EmailConfigDocument,
         msg_mime::{MsgMimeDocument, MsgMimeFile},
         msg_struct::{MsgContact, MsgStructDocument},
+        user_migration::{
+            hash_password_argon2id, normalize_campaign_name, normalize_lookup_key, split_name,
+            MongoUserDocument, MysqlUser, NormalizedUser,
+        },
     },
-    routes::structs::{MessageSyncResponse, TicketBatchResponse, TicketSyncResponse},
+    routes::structs::{MessageSyncResponse, TicketBatchResponse, TicketSyncResponse, UserSyncResponse},
     ssh::config::RemoteDirEntry,
     ssh::SshError,
     state::AppState,
@@ -31,6 +39,7 @@ use crate::{
 const DEFAULT_CASE_BATCH_SIZE: usize = 10;
 const DEFAULT_CASE_PARALLELISM: usize = 2;
 const DEFAULT_FILE_UPLOAD_CONCURRENCY: usize = 4;
+const DEFAULT_USER_BATCH_SIZE: usize = 25;
 
 fn case_batch_size() -> usize {
     env::var("CASE_BATCH_SIZE")
@@ -56,6 +65,14 @@ fn file_upload_concurrency() -> usize {
         .unwrap_or(DEFAULT_FILE_UPLOAD_CONCURRENCY)
 }
 
+fn user_batch_size() -> usize {
+    env::var("USER_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_USER_BATCH_SIZE)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tickets/sync", post(sync_tickets_by_range))
@@ -64,6 +81,654 @@ pub fn router() -> Router<AppState> {
             "/tickets/obtener_correos_respuesta",
             post(sync_responses_by_range),
         )
+        .route("/users/sync", post(sync_users))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UserSyncRequest {
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    user_ids: Vec<String>,
+}
+
+async fn sync_users(
+    State(state): State<AppState>,
+    payload: Option<Json<UserSyncRequest>>,
+) -> Response {
+    let requested_ids = payload
+        .map(|Json(body)| {
+            let mut ids = body.user_ids;
+            if let Some(single) = body.user_id {
+                if !ids.contains(&single) {
+                    ids.push(single);
+                }
+            }
+            ids
+        })
+        .unwrap_or_default();
+
+    let configured_ids = if requested_ids.is_empty() {
+        load_configured_user_ids()
+    } else {
+        Vec::new()
+    };
+
+    let ids_to_fetch = if !requested_ids.is_empty() {
+        requested_ids
+    } else {
+        configured_ids
+    };
+
+    let mysql_users = if ids_to_fetch.is_empty() {
+        match fetch_all_mysql_users(&state).await {
+            Ok(users) => users,
+            Err(err) => {
+                let body = Json(UserSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    processed: 0,
+                    inserted: 0,
+                    skipped: 0,
+                    errors: 0,
+                    skipped_missing_reference: 0,
+                    skipped_duplicate: 0,
+                    missing_references: Vec::new(),
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
+            }
+        }
+    } else {
+        match fetch_mysql_users_by_ids(&state, &ids_to_fetch).await {
+            Ok(users) => users,
+            Err(err) => {
+                let body = Json(UserSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    processed: 0,
+                    inserted: 0,
+                    skipped: 0,
+                    errors: 0,
+                    skipped_missing_reference: 0,
+                    skipped_duplicate: 0,
+                    missing_references: Vec::new(),
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
+            }
+        }
+    };
+
+    if mysql_users.is_empty() {
+        let body = Json(UserSyncResponse {
+            status: "ok".to_string(),
+            detail: "No se encontraron usuarios para migrar".to_string(),
+            processed: 0,
+            inserted: 0,
+            skipped: 0,
+            errors: 0,
+            skipped_missing_reference: 0,
+            skipped_duplicate: 0,
+            missing_references: Vec::new(),
+        });
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let db_name =
+        env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".to_string());
+    let collection_name =
+        env::var("MONGO_USERS_COLLECTION").unwrap_or_else(|_| "crm-users".to_string());
+
+    let aliases = campaign_aliases();
+    let refs = match load_branch_office_refs(&state, &db_name).await {
+        Ok(refs) => refs,
+        Err(err) => {
+            let body = Json(UserSyncResponse {
+                status: "error".to_string(),
+                detail: err.to_string(),
+                processed: 0,
+                inserted: 0,
+                skipped: 0,
+                errors: 0,
+                skipped_missing_reference: 0,
+                skipped_duplicate: 0,
+                missing_references: Vec::new(),
+            });
+            return (StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
+        }
+    };
+
+    let collection = state
+        .mongo
+        .database(&db_name)
+        .collection::<MongoUserDocument>(&collection_name);
+
+    let mut processed = 0usize;
+    let mut inserted = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    let mut skipped_missing_reference = 0usize;
+    let mut skipped_duplicate = 0usize;
+    let mut missing_references = Vec::new();
+
+    let batch_size = user_batch_size();
+    let total_batches = (mysql_users.len() + batch_size - 1) / batch_size;
+    info!(
+        "Usuarios - Se procesarán {} usuario(s) en {} lote(s) de hasta {} elementos",
+        mysql_users.len(),
+        total_batches,
+        batch_size
+    );
+
+    for (index, batch) in mysql_users.chunks(batch_size).enumerate() {
+        info!(
+            "Usuarios - Iniciando lote {}/{} con {} usuario(s)",
+            index + 1,
+            total_batches,
+            batch.len()
+        );
+
+        for raw_user in batch {
+            processed += 1;
+            let normalized = normalize_mysql_user(raw_user, &aliases);
+            let Some(reference) = resolve_user_references(&normalized, &refs) else {
+                warn!(
+                    "Usuarios - No se encontró referencia para campaña '{}' y departamento '{}' (usuario {})",
+                    normalized.campaign_name,
+                    normalized.department_name,
+                    normalized.username
+                );
+                skipped += 1;
+                skipped_missing_reference += 1;
+                if missing_references.len() < 10 {
+                    missing_references.push(format!(
+                        "{} | campana='{}' | departamento='{}' | key='{}|{}'",
+                        normalized.username,
+                        normalized.campaign_name,
+                        normalized.department_name,
+                        normalized.campaign_key,
+                        normalized.department_key
+                    ));
+                }
+                continue;
+            };
+
+            let mongo_user = build_mongo_user_document(&normalized, &reference);
+            match upsert_mongo_user(&collection, &mongo_user).await {
+                Ok(UpsertResult::Inserted) => inserted += 1,
+                Ok(UpsertResult::Existing) => {
+                    skipped += 1;
+                    skipped_duplicate += 1;
+                }
+                Err(err) => {
+                    errors += 1;
+                    error!(
+                        "Usuarios - Fallo al insertar usuario {}: {}",
+                        normalized.username, err
+                    );
+                }
+            }
+        }
+    }
+
+    let status = if errors == 0 { "ok" } else { "partial" };
+    let detail = format!(
+        "Usuarios procesados: {} | insertados: {} | omitidos: {} | errores: {}",
+        processed, inserted, skipped, errors
+    );
+
+    let body = Json(UserSyncResponse {
+        status: status.to_string(),
+        detail,
+        processed,
+        inserted,
+        skipped,
+        errors,
+        skipped_missing_reference,
+        skipped_duplicate,
+        missing_references,
+    });
+
+    (StatusCode::OK, body).into_response()
+}
+
+#[derive(Debug, Clone)]
+struct BranchOfficeRef {
+    branch_office_id: ObjectId,
+    client_id: String,
+    campaign_id: String,
+    department_id: String,
+}
+
+#[derive(Debug, Default)]
+struct BranchOfficeRefs {
+    by_campaign_department: HashMap<String, BranchOfficeRef>,
+    by_campaign: HashMap<String, BranchOfficeRef>,
+}
+
+#[derive(Debug)]
+enum UpsertResult {
+    Inserted,
+    Existing,
+}
+
+fn load_configured_user_ids() -> Vec<String> {
+    env::var("USER_SYNC_IDS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn users_table_name() -> String {
+    env::var("MYSQL_USERS_TABLE").unwrap_or_else(|_| "usuarios".to_string())
+}
+
+fn campaign_aliases() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+fn branch_office_filter_id() -> Option<ObjectId> {
+    env::var("MONGO_BRANCH_OFFICE_ID")
+        .ok()
+        .and_then(|raw| ObjectId::parse_str(raw.trim()).ok())
+}
+
+fn normalize_mysql_user(raw: &MysqlUser, aliases: &HashMap<String, String>) -> NormalizedUser {
+    let (first_names, last_names) = split_name(&raw.nombre);
+    let campaign_name = raw.campana.trim().to_string();
+    let department_name = raw.departamento.trim().to_string();
+
+    NormalizedUser {
+        username: raw.usuario.trim().to_string(),
+        password: raw.password.clone(),
+        first_names,
+        last_names,
+        campaign_name,
+        department_name,
+        campaign_key: normalize_campaign_name(&raw.campana, aliases),
+        department_key: normalize_lookup_key(&raw.departamento),
+        created_at: raw.fecha_creacion,
+        last_connection: raw.fecha_conexion,
+        status: raw.estatus,
+    }
+}
+
+fn build_mongo_user_document(
+    user: &NormalizedUser,
+    reference: &BranchOfficeRef,
+) -> MongoUserDocument {
+    let mut document = MongoUserDocument::default();
+    document.user = user.username.clone();
+    document.password = match hash_password_argon2id(&user.password) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                "Usuarios - No se pudo hashear la contraseña de {}: {}",
+                user.username, err
+            );
+            user.password.clone()
+        }
+    };
+    document.first_names = user.first_names.clone();
+    document.last_names = user.last_names.clone();
+    document.branch_office_ids = vec![reference.branch_office_id.to_hex()];
+    document.client_ids = vec![reference.client_id.clone()];
+    document.campaign_ids = vec![reference.campaign_id.clone()];
+    document.department_id = reference.department_id.clone();
+    document.status = user.status;
+    document.deleted = 0;
+    document.date_registration = user.created_at.map(|value| {
+        mongodb::bson::DateTime::from_millis(value.and_utc().timestamp_millis())
+    });
+    document.date_last_connection = user.last_connection.map(|value| {
+        mongodb::bson::DateTime::from_millis(value.and_utc().timestamp_millis())
+    });
+    document
+}
+
+async fn upsert_mongo_user(
+    collection: &mongodb::Collection<MongoUserDocument>,
+    user: &MongoUserDocument,
+) -> Result<UpsertResult, UserSyncError> {
+    match collection.insert_one(user).await {
+        Ok(_) => Ok(UpsertResult::Inserted),
+        Err(err) => {
+            if is_duplicate_key_error(&err) {
+                Ok(UpsertResult::Existing)
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
+async fn fetch_mysql_users_by_ids(
+    state: &AppState,
+    user_ids: &[String],
+) -> Result<Vec<MysqlUser>, UserSyncError> {
+    if user_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table = users_table_name();
+    let placeholders = std::iter::repeat("?")
+        .take(user_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT Usuario, Password, Nombre, Numero_Empleado, Turno, Departamento, Campana, Supervisor, Imagen_fondo, Fecha_password, Fecha_creacion, Fecha_Conexion, Estatus, Id_Confg, Actividad, Agendado_Ticket, Eliminacion_Casos, Resolver_casos, Creacion_Casos, Correo_salida, Graficas, Publicaciones_Favoritas, Extension FROM {table} WHERE Usuario IN ({placeholders})"
+    );
+    let values = user_ids
+        .iter()
+        .map(|value| Value::String(Some(value.clone())))
+        .collect::<Vec<_>>();
+    let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
+    let rows = state.mysql.query_all_raw(statement).await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(build_mysql_user_from_row)
+        .collect())
+}
+
+async fn fetch_all_mysql_users(state: &AppState) -> Result<Vec<MysqlUser>, UserSyncError> {
+    let table = users_table_name();
+    let sql = format!(
+        "SELECT Usuario, Password, Nombre, Numero_Empleado, Turno, Departamento, Campana, Supervisor, Imagen_fondo, Fecha_password, Fecha_creacion, Fecha_Conexion, Estatus, Id_Confg, Actividad, Agendado_Ticket, Eliminacion_Casos, Resolver_casos, Creacion_Casos, Correo_salida, Graficas, Publicaciones_Favoritas, Extension FROM {table}"
+    );
+    let statement = Statement::from_string(DbBackend::MySql, sql);
+    let rows = state.mysql.query_all_raw(statement).await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(build_mysql_user_from_row)
+        .collect())
+}
+
+fn build_mysql_user_from_row(row: sea_orm::QueryResult) -> Option<MysqlUser> {
+    let usuario = get_any_string(&row, &["Usuario", "usuario", "user", "User", "cu_user"])?;
+    let password = get_any_string(&row, &["password", "Password", "contrasena", "Contraseña"])
+        .unwrap_or_default();
+    let nombre = get_any_string(&row, &["nombre", "Nombre"]).unwrap_or_default();
+    let numero_empleado =
+        get_any_string(&row, &["Numero_Empleado", "numero_empleado"]).unwrap_or_default();
+    let turno = get_any_string(&row, &["Turno", "turno"]).unwrap_or_default();
+    let campana = get_any_string(&row, &["campana", "Campana", "campaña", "Campaña"])
+        .unwrap_or_default();
+    let departamento =
+        get_any_string(&row, &["departamento", "Departamento"]).unwrap_or_default();
+    let supervisor = get_any_string(&row, &["Supervisor", "supervisor"]).unwrap_or_default();
+    let imagen_fondo =
+        get_any_string(&row, &["Imagen_fondo", "imagen_fondo"]).unwrap_or_default();
+    let fecha_password = get_naive_datetime(
+        &row,
+        &["Fecha_password", "fecha_password", "FechaPassword"],
+    );
+    let fecha_creacion = get_naive_datetime(
+        &row,
+        &[
+            "fecha_creacion",
+            "Fecha_Creacion",
+            "Fecha_creacion",
+            "FechaCreacion",
+        ],
+    );
+    let fecha_conexion = get_naive_datetime(
+        &row,
+        &[
+            "fecha_conexion",
+            "Fecha_Conexion",
+            "Fecha_conexion",
+            "FechaConexion",
+        ],
+    );
+    let estatus = get_i32(&row, &["estatus", "Estatus"]).unwrap_or(0);
+    let id_confg = get_i32(&row, &["Id_Confg", "id_confg"]).unwrap_or(0);
+    let actividad = get_i32(&row, &["Actividad", "actividad"]).unwrap_or(0);
+    let agendado_ticket =
+        get_i32(&row, &["Agendado_Ticket", "agendado_ticket"]);
+    let eliminacion_casos =
+        get_i32(&row, &["Eliminacion_Casos", "eliminacion_casos"]);
+    let resolver_casos = get_i32(&row, &["Resolver_casos", "resolver_casos"]);
+    let creacion_casos = get_i32(&row, &["Creacion_Casos", "creacion_casos"]);
+    let correo_salida = get_i32(&row, &["Correo_salida", "correo_salida"]);
+    let graficas = get_i32(&row, &["Graficas", "graficas"]);
+    let publicaciones_favoritas =
+        get_any_string(&row, &["Publicaciones_Favoritas", "publicaciones_favoritas"]);
+    let extension = get_any_string(&row, &["Extension", "extension"]).unwrap_or_default();
+
+    Some(MysqlUser {
+        usuario,
+        password,
+        nombre,
+        numero_empleado,
+        turno,
+        campana,
+        departamento,
+        supervisor,
+        imagen_fondo,
+        fecha_password,
+        fecha_creacion,
+        fecha_conexion,
+        estatus,
+        id_confg,
+        actividad,
+        agendado_ticket,
+        eliminacion_casos,
+        resolver_casos,
+        creacion_casos,
+        correo_salida,
+        graficas,
+        publicaciones_favoritas,
+        extension,
+    })
+}
+
+fn resolve_user_references(
+    user: &NormalizedUser,
+    refs: &BranchOfficeRefs,
+) -> Option<BranchOfficeRef> {
+    let key = format!("{}|{}", user.campaign_key, user.department_key);
+    refs.by_campaign_department
+        .get(&key)
+        .cloned()
+        .or_else(|| refs.by_campaign.get(&user.campaign_key).cloned())
+}
+
+async fn load_branch_office_refs(
+    state: &AppState,
+    db_name: &str,
+) -> Result<BranchOfficeRefs, UserSyncError> {
+    let branch_db_name =
+        env::var("MONGO_BRANCH_OFFICE_DB").unwrap_or_else(|_| db_name.to_string());
+    let collection_name =
+        env::var("MONGO_BRANCH_OFFICE_COLLECTION").unwrap_or_else(|_| "crm-branch-office".into());
+    let filter = branch_office_filter_id()
+        .map(|id| doc! { "_id": id })
+        .unwrap_or_else(|| doc! {});
+    let collection = state
+        .mongo
+        .database(&branch_db_name)
+        .collection::<Document>(&collection_name);
+    let documents = collection
+        .find(filter)
+        .await?
+        .try_collect::<Vec<Document>>()
+        .await?;
+
+    let mut refs = BranchOfficeRefs::default();
+
+    for doc in documents {
+        let Some(branch_office_id) = doc.get_object_id("_id").ok() else {
+            continue;
+        };
+        let clients = get_doc_array(&doc, &["cbo_list_clients", "clients", "client", "clientes"]);
+        for client in clients {
+            let client_id =
+                get_doc_string(&client, &["id", "id_client", "client_id", "cu_client"])
+                    .unwrap_or_default();
+            let campaigns = get_doc_array(
+                &client,
+                &["list_campaigns", "campaigns", "campanas", "campañas"],
+            );
+            for campaign in campaigns {
+                let campaign_id = get_doc_string(
+                    &campaign,
+                    &["id", "id_campaign", "campaign_id", "cu_campaign"],
+                )
+                .unwrap_or_default();
+                let campaign_name =
+                    get_doc_string(&campaign, &["campaign", "campaign_name", "nombre", "name"])
+                .unwrap_or_default();
+                if campaign_name.is_empty() {
+                    continue;
+                }
+
+        let campaign_key = normalize_lookup_key(&campaign_name);
+                let departments = get_doc_array(
+                    &campaign,
+                    &["list_departments", "departments", "departamentos"],
+                );
+                if departments.is_empty() {
+                    let reference = BranchOfficeRef {
+                        branch_office_id,
+                        client_id: client_id.clone(),
+                        campaign_id: campaign_id.clone(),
+                        department_id: String::new(),
+                    };
+                    refs.by_campaign.entry(campaign_key).or_insert(reference);
+                    continue;
+                }
+
+                for department in departments {
+                    let department_id = get_doc_string(
+                        &department,
+                        &[
+                            "id",
+                            "id_department",
+                            "department_id",
+                            "cu_department",
+                            "id_departamento",
+                        ],
+                    )
+                    .unwrap_or_default();
+                    let department_name =
+                        get_doc_string(&department, &["department", "department_name", "name"])
+                    .unwrap_or_default();
+                    if department_name.is_empty() {
+                        continue;
+                    }
+
+                    let department_key = normalize_lookup_key(&department_name);
+                    let reference = BranchOfficeRef {
+                        branch_office_id,
+                        client_id: client_id.clone(),
+                        campaign_id: campaign_id.clone(),
+                        department_id: department_id.clone(),
+                    };
+                    refs.by_campaign_department
+                        .entry(format!("{campaign_key}|{department_key}"))
+                        .or_insert_with(|| reference.clone());
+                    refs.by_campaign
+                        .entry(campaign_key.clone())
+                        .or_insert(reference);
+                }
+            }
+        }
+    }
+
+    Ok(refs)
+}
+
+fn get_doc_array(doc: &Document, keys: &[&str]) -> Vec<Document> {
+    for key in keys {
+        if let Some(Bson::Array(values)) = doc.get(*key) {
+            return values
+                .iter()
+                .filter_map(|value| value.as_document().cloned())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn get_doc_string(doc: &Document, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = doc.get(*key) {
+            if let Some(value) = bson_to_string(value) {
+                let trimmed = value.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn bson_to_string(value: &Bson) -> Option<String> {
+    match value {
+        Bson::String(value) => Some(value.clone()),
+        Bson::ObjectId(value) => Some(value.to_hex()),
+        Bson::Int32(value) => Some(value.to_string()),
+        Bson::Int64(value) => Some(value.to_string()),
+        Bson::Double(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
+    let message = err.to_string();
+    message.contains("E11000") || message.contains("duplicate key")
+}
+
+fn get_i64(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<i64> {
+    columns.iter().find_map(|column| {
+        row.try_get::<i64>("", column)
+            .ok()
+            .or_else(|| row.try_get::<i32>("", column).ok().map(i64::from))
+            .or_else(|| {
+                row.try_get::<String>("", column)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+            })
+    })
+}
+
+fn get_i32(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<i32> {
+    columns.iter().find_map(|column| {
+        row.try_get::<i32>("", column)
+            .ok()
+            .or_else(|| row.try_get::<i64>("", column).ok().map(|value| value as i32))
+            .or_else(|| {
+                row.try_get::<String>("", column)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok())
+            })
+    })
+}
+
+fn get_naive_datetime(
+    row: &sea_orm::QueryResult,
+    columns: &[&str],
+) -> Option<NaiveDateTime> {
+    const FORMATS: [&str; 3] = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M:%S%p"];
+    columns.iter().find_map(|column| {
+        row.try_get::<NaiveDateTime>("", column)
+            .ok()
+            .or_else(|| {
+                row.try_get::<String>("", column).ok().and_then(|raw| {
+                    let trimmed = raw.trim();
+                    FORMATS
+                        .iter()
+                        .find_map(|fmt| NaiveDateTime::parse_from_str(trimmed, fmt).ok())
+                })
+            })
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1846,6 +2511,16 @@ fn parse_mysql_datetime(raw: Option<&str>) -> Option<mongodb::bson::DateTime> {
             .find_map(|fmt| NaiveDateTime::parse_from_str(&normalized, fmt).ok())
             .map(|naive| mongodb::bson::DateTime::from_millis(naive.and_utc().timestamp_millis()))
     })
+}
+
+#[derive(Debug, thiserror::Error)]
+enum UserSyncError {
+    #[error("Error al consultar MySQL: {0}")]
+    Mysql(#[from] sea_orm::DbErr),
+    #[error("Error de MongoDB: {0}")]
+    Mongo(#[from] mongodb::error::Error),
+    #[error("No se pudo serializar el documento MongoDB: {0}")]
+    Bson(#[from] mongodb::bson::ser::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
