@@ -41,6 +41,7 @@ const DEFAULT_CASE_BATCH_SIZE: usize = 10;
 const DEFAULT_CASE_PARALLELISM: usize = 2;
 const DEFAULT_FILE_UPLOAD_CONCURRENCY: usize = 4;
 const DEFAULT_USER_BATCH_SIZE: usize = 25;
+const MAX_HTML_BYTES: usize = 15 * 1024 * 1024;
 
 fn case_batch_size() -> usize {
     env::var("CASE_BATCH_SIZE")
@@ -1531,9 +1532,13 @@ async fn sync_ticket_case(
         .database(&db_name)
         .collection::<MsgMimeDocument>("msg-mime");
 
-    let html_content = html_body
-        .filter(|content| !content.is_empty())
-        .unwrap_or_else(|| mysql_record.subject.clone().unwrap_or_default());
+    let html_content = select_html_content(
+        html_body,
+        &mime_files,
+        mysql_record.subject.clone().unwrap_or_default(),
+        "tickets/sync",
+        &case_id,
+    );
 
     let message_type = "entrada".to_string();
 
@@ -1760,7 +1765,13 @@ async fn sync_notes_for_case(
         let folder = sanitize_segment(&format!("Nota_{}", note.id));
         let prefix = format!("{}/notas/{}", base_prefix, folder);
         let (files, html_body) = build_files_from_s3(state, &prefix).await?;
-        let html_content = html_body.unwrap_or_else(|| format!("Nota {}", note.id));
+        let html_content = select_html_content(
+            html_body,
+            &files,
+            format!("Nota {}", note.id),
+            "tickets/obtener_correos_notas",
+            &case_id,
+        );
         let summary = note.usuario.clone().unwrap_or_default();
 
         let mime_document = MsgMimeDocument {
@@ -1889,7 +1900,13 @@ async fn sync_responses_for_case(
             .asunto
             .clone()
             .unwrap_or_else(|| format!("Respuesta {}", response.id));
-        let html_content = html_body.unwrap_or_else(|| subject.clone());
+        let html_content = select_html_content(
+            html_body,
+            &files,
+            subject.clone(),
+            "tickets/obtener_correos_respuesta",
+            &case_id,
+        );
 
         let mime_document = MsgMimeDocument {
             id: ObjectId::new(),
@@ -2639,6 +2656,64 @@ fn split_emails(raw: Option<String>) -> Vec<String> {
 
 fn get_any_string(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<String> {
     columns.iter().find_map(|column| get_string(row, column))
+}
+
+fn select_html_content(
+    html_body: Option<String>,
+    files: &[MsgMimeFile],
+    fallback: String,
+    endpoint: &str,
+    case_id: &str,
+) -> String {
+    let html = html_body.filter(|content| !content.is_empty());
+    let Some(html) = html else {
+        return fallback;
+    };
+
+    if html.as_bytes().len() <= MAX_HTML_BYTES {
+        return html;
+    }
+
+    if let Some(url) = find_index_html_url(files, endpoint) {
+        warn!(
+            "HTML excede límite ({} bytes). Usando URL en {} para caso {}",
+            html.as_bytes().len(),
+            endpoint,
+            case_id
+        );
+        return url;
+    }
+
+    warn!(
+        "HTML excede límite ({} bytes) y no se encontró index.html en {} para caso {}",
+        html.as_bytes().len(),
+        endpoint,
+        case_id
+    );
+    fallback
+}
+
+fn find_index_html_url(files: &[MsgMimeFile], endpoint: &str) -> Option<String> {
+    let preferred = match endpoint {
+        "tickets/sync" => "/original/index.html",
+        "tickets/obtener_correos_notas" => "/notas/",
+        "tickets/obtener_correos_respuesta" => "/respuestas/",
+        _ => "",
+    };
+
+    if !preferred.is_empty() {
+        if let Some(file) = files.iter().find(|file| {
+            file.file_name.eq_ignore_ascii_case("index.html")
+                && file.file_url.contains(preferred)
+        }) {
+            return Some(file.file_url.clone());
+        }
+    }
+
+    files
+        .iter()
+        .find(|file| file.file_name.eq_ignore_ascii_case("index.html"))
+        .map(|file| file.file_url.clone())
 }
 
 async fn write_errors_file(path: &str, failures: &[String]) -> Result<(), std::io::Error> {
