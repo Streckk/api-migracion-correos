@@ -64,11 +64,12 @@ fn resolve_path(base_path: &str, raw: &str) -> String {
         return base_path.to_string();
     }
 
-    if trimmed.starts_with('/') {
-        return normalize_path(trimmed.to_string());
+    let left_trimmed = raw.trim_start();
+    if left_trimmed.starts_with('/') {
+        return left_trimmed.to_string();
     }
 
-    let relative = trimmed.trim_matches('/');
+    let relative = left_trimmed.trim_matches('/');
     if base_path == "/" {
         format!("/{}", relative)
     } else {
