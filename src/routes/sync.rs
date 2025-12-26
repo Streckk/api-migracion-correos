@@ -1061,6 +1061,14 @@ async fn sync_tickets_by_range(
         )
     };
 
+    if !failures.is_empty() {
+        if let Err(err) =
+            write_errors_file("tickets_sync_errors.txt", &failures).await
+        {
+            warn!("No se pudo escribir archivo de errores: {err}");
+        }
+    }
+
     let body = Json(TicketBatchResponse {
         status: status.to_string(),
         detail,
@@ -1250,6 +1258,14 @@ async fn sync_notes_by_range(
             failures.len()
         )
     };
+
+    if !failures.is_empty() {
+        if let Err(err) =
+            write_errors_file("tickets_notes_errors.txt", &failures).await
+        {
+            warn!("No se pudo escribir archivo de errores: {err}");
+        }
+    }
 
     let body = Json(MessageSyncResponse {
         status: status.to_string(),
@@ -1443,6 +1459,14 @@ async fn sync_responses_by_range(
             failures.len()
         )
     };
+
+    if !failures.is_empty() {
+        if let Err(err) =
+            write_errors_file("tickets_responses_errors.txt", &failures).await
+        {
+            warn!("No se pudo escribir archivo de errores: {err}");
+        }
+    }
 
     let body = Json(MessageSyncResponse {
         status: status.to_string(),
@@ -2615,6 +2639,14 @@ fn split_emails(raw: Option<String>) -> Vec<String> {
 
 fn get_any_string(row: &sea_orm::QueryResult, columns: &[&str]) -> Option<String> {
     columns.iter().find_map(|column| get_string(row, column))
+}
+
+async fn write_errors_file(path: &str, failures: &[String]) -> Result<(), std::io::Error> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let contents = failures.join("\n");
+    tokio::fs::write(path, contents).await
 }
 
 fn build_mysql_record(
