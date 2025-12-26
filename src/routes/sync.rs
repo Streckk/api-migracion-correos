@@ -11,7 +11,8 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone};
+use chrono_tz::America::Monterrey;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use mime_guess::MimeGuess;
 use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
@@ -26,7 +27,7 @@ use crate::{
         msg_struct::{MsgContact, MsgStructDocument},
         user_migration::{
             hash_password_argon2id, normalize_campaign_name, normalize_lookup_key, split_name,
-            MongoUserDocument, MysqlUser, NormalizedUser,
+            MongoUserDocument, MysqlUser, NormalizedUser, UserSettingsDocument,
         },
     },
     routes::structs::{MessageSyncResponse, TicketBatchResponse, TicketSyncResponse, UserSyncResponse},
@@ -175,11 +176,59 @@ async fn sync_users(
 
     let db_name =
         env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".to_string());
+    let users_db_name = env::var("MONGO_USERS_DB").unwrap_or_else(|_| db_name.clone());
     let collection_name =
         env::var("MONGO_USERS_COLLECTION").unwrap_or_else(|_| "crm-users".to_string());
+    let settings_collection_name =
+        env::var("MONGO_USER_SETTINGS_COLLECTION").unwrap_or_else(|_| "crm-user-settings".to_string());
+
+    let collection = state
+        .mongo
+        .database(&users_db_name)
+        .collection::<MongoUserDocument>(&collection_name);
+    let collection_docs = state
+        .mongo
+        .database(&users_db_name)
+        .collection::<Document>(&collection_name);
+    let settings_collection = state
+        .mongo
+        .database(&users_db_name)
+        .collection::<UserSettingsDocument>(&settings_collection_name);
+
+    let (mysql_users, already_present, existing_sample) =
+        match filter_pending_users(&collection_docs, mysql_users).await {
+            Ok(result) => result,
+            Err(err) => {
+                let body = Json(UserSyncResponse {
+                    status: "error".to_string(),
+                    detail: err.to_string(),
+                    processed: 0,
+                    inserted: 0,
+                    skipped: 0,
+                    errors: 0,
+                    skipped_missing_reference: 0,
+                    skipped_duplicate: 0,
+                    missing_references: Vec::new(),
+                });
+                return (StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
+            }
+        };
+
+    if already_present > 0 {
+        warn!(
+            "Usuarios - {} usuario(s) ya existen en MongoDB y serán omitidos",
+            already_present
+        );
+        if !existing_sample.is_empty() {
+            warn!(
+                "Usuarios - Ejemplo de usuarios existentes: {}",
+                existing_sample.join(", ")
+            );
+        }
+    }
 
     let aliases = campaign_aliases();
-    let refs = match load_branch_office_refs(&state, &db_name).await {
+    let refs = match load_branch_office_refs(&state, &users_db_name).await {
         Ok(refs) => refs,
         Err(err) => {
             let body = Json(UserSyncResponse {
@@ -197,17 +246,12 @@ async fn sync_users(
         }
     };
 
-    let collection = state
-        .mongo
-        .database(&db_name)
-        .collection::<MongoUserDocument>(&collection_name);
-
     let mut processed = 0usize;
     let mut inserted = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut skipped_missing_reference = 0usize;
-    let mut skipped_duplicate = 0usize;
+    let mut skipped_duplicate = already_present;
     let mut missing_references = Vec::new();
 
     let batch_size = user_batch_size();
@@ -252,7 +296,36 @@ async fn sync_users(
                 continue;
             };
 
-            let mongo_user = build_mongo_user_document(&normalized, &reference);
+            let mut settings_doc = build_user_settings_document();
+            let settings_result = match settings_collection.insert_one(&settings_doc).await {
+                Ok(result) => result,
+                Err(err) => {
+                    errors += 1;
+                    error!(
+                        "Usuarios - Fallo al insertar settings de {}: {}",
+                        normalized.username, err
+                    );
+                    continue;
+                }
+            };
+
+            let Some(settings_id) = settings_result.inserted_id.as_object_id() else {
+                errors += 1;
+                error!(
+                    "Usuarios - No se obtuvo ObjectId para settings de {}",
+                    normalized.username
+                );
+                continue;
+            };
+            settings_doc.id = Some(settings_id);
+            info!(
+                "Usuarios - Settings insertado en {}.{} con _id {}",
+                users_db_name,
+                settings_collection_name,
+                settings_id.to_hex()
+            );
+
+            let mongo_user = build_mongo_user_document(&normalized, &reference, settings_doc);
             match upsert_mongo_user(&collection, &mongo_user).await {
                 Ok(UpsertResult::Inserted) => inserted += 1,
                 Ok(UpsertResult::Existing) => {
@@ -311,6 +384,51 @@ enum UpsertResult {
     Existing,
 }
 
+async fn filter_pending_users(
+    collection: &mongodb::Collection<Document>,
+    users: Vec<MysqlUser>,
+) -> Result<(Vec<MysqlUser>, usize, Vec<String>), UserSyncError> {
+    if users.is_empty() {
+        return Ok((Vec::new(), 0, Vec::new()));
+    }
+
+    let mut existing = HashSet::new();
+    let mut user_names = users
+        .iter()
+        .map(|user| user.usuario.clone())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    user_names.sort();
+    user_names.dedup();
+
+    const BATCH: usize = 500;
+    for chunk in user_names.chunks(BATCH) {
+        let cursor = collection
+            .find(doc! { "cu_user": { "$in": chunk } })
+            .await?;
+        let docs = cursor.try_collect::<Vec<Document>>().await?;
+        for doc in docs {
+            if let Ok(value) = doc.get_str("cu_user") {
+                existing.insert(value.to_string());
+            }
+        }
+    }
+
+    let already_present = existing.len();
+    let mut existing_sample = existing.iter().cloned().collect::<Vec<_>>();
+    existing_sample.sort();
+    if existing_sample.len() > 20 {
+        existing_sample.truncate(20);
+    }
+    let filtered = users
+        .into_iter()
+        .filter(|user| !existing.contains(&user.usuario))
+        .collect::<Vec<_>>();
+
+    Ok((filtered, already_present, existing_sample))
+}
+
 fn load_configured_user_ids() -> Vec<String> {
     env::var("USER_SYNC_IDS")
         .ok()
@@ -351,6 +469,7 @@ fn normalize_mysql_user(raw: &MysqlUser, aliases: &HashMap<String, String>) -> N
         department_name,
         campaign_key: normalize_campaign_name(&raw.campana, aliases),
         department_key: normalize_lookup_key(&raw.departamento),
+        password_changed_at: raw.fecha_password,
         created_at: raw.fecha_creacion,
         last_connection: raw.fecha_conexion,
         status: raw.estatus,
@@ -360,6 +479,7 @@ fn normalize_mysql_user(raw: &MysqlUser, aliases: &HashMap<String, String>) -> N
 fn build_mongo_user_document(
     user: &NormalizedUser,
     reference: &BranchOfficeRef,
+    settings: UserSettingsDocument,
 ) -> MongoUserDocument {
     let mut document = MongoUserDocument::default();
     document.user = user.username.clone();
@@ -384,10 +504,28 @@ fn build_mongo_user_document(
     document.date_registration = user.created_at.map(|value| {
         mongodb::bson::DateTime::from_millis(value.and_utc().timestamp_millis())
     });
+    document.date_change_password = user.password_changed_at.map(|value| {
+        mongodb::bson::DateTime::from_millis(value.and_utc().timestamp_millis())
+    });
     document.date_last_connection = user.last_connection.map(|value| {
         mongodb::bson::DateTime::from_millis(value.and_utc().timestamp_millis())
     });
+    document.date_migration = Some(now_monterrey_bson());
+    document.color = "#000000".to_string();
+    document.config_id = settings.id;
+    document.settings = settings;
     document
+}
+
+fn build_user_settings_document() -> UserSettingsDocument {
+    let mut settings = UserSettingsDocument::default();
+    settings.cc_date_registration = Some(now_monterrey_bson());
+    settings
+}
+
+fn now_monterrey_bson() -> mongodb::bson::DateTime {
+    let now_monterrey = Monterrey.from_utc_datetime(&chrono::Utc::now().naive_utc());
+    mongodb::bson::DateTime::from_millis(now_monterrey.timestamp_millis())
 }
 
 async fn upsert_mongo_user(
@@ -1971,7 +2109,21 @@ async fn gather_case_files(
     s3_prefix: &str,
     tasks: &mut Vec<FileTask>,
 ) -> Result<(), TicketSyncError> {
-    let entries = state.ssh_service.list_remote_dir(remote_case_path).await?;
+    info!(
+        "Listando archivos del caso en ruta remota: {}",
+        remote_case_path
+    );
+    let entries = state
+        .ssh_service
+        .list_remote_dir(remote_case_path)
+        .await
+        .map_err(|err| {
+            error!(
+                "Error al listar directorio remoto {}: {}",
+                remote_case_path, err
+            );
+            err
+        })?;
 
     for entry in entries {
         if entry.is_dir {
@@ -2029,7 +2181,14 @@ async fn gather_simple_dir(
     key_prefix: &str,
     tasks: &mut Vec<FileTask>,
 ) -> Result<(), TicketSyncError> {
-    let entries = state.ssh_service.list_remote_dir(remote_dir).await?;
+    let entries = state
+        .ssh_service
+        .list_remote_dir(remote_dir)
+        .await
+        .map_err(|err| {
+            error!("Error al listar directorio remoto {}: {}", remote_dir, err);
+            err
+        })?;
     for entry in entries {
         if entry.is_dir {
             continue;
@@ -2046,13 +2205,27 @@ async fn gather_notes(
     s3_prefix: &str,
     tasks: &mut Vec<FileTask>,
 ) -> Result<(), TicketSyncError> {
-    let notes = state.ssh_service.list_remote_dir(remote_dir).await?;
+    let notes = state
+        .ssh_service
+        .list_remote_dir(remote_dir)
+        .await
+        .map_err(|err| {
+            error!("Error al listar directorio remoto {}: {}", remote_dir, err);
+            err
+        })?;
     for note in notes {
         if !note.is_dir {
             continue;
         }
         let note_prefix = format!("{}/notas/{}", s3_prefix, sanitize_segment(&note.name));
-        let contents = state.ssh_service.list_remote_dir(&note.path).await?;
+        let contents = state
+            .ssh_service
+            .list_remote_dir(&note.path)
+            .await
+            .map_err(|err| {
+                error!("Error al listar directorio remoto {}: {}", note.path, err);
+                err
+            })?;
         for content in contents {
             if content.is_dir {
                 let dir_name = content.name.to_lowercase();
@@ -2080,7 +2253,14 @@ async fn gather_responses(
     s3_prefix: &str,
     tasks: &mut Vec<FileTask>,
 ) -> Result<(), TicketSyncError> {
-    let responses = state.ssh_service.list_remote_dir(remote_dir).await?;
+    let responses = state
+        .ssh_service
+        .list_remote_dir(remote_dir)
+        .await
+        .map_err(|err| {
+            error!("Error al listar directorio remoto {}: {}", remote_dir, err);
+            err
+        })?;
     for response in responses {
         if !response.is_dir {
             continue;
@@ -2090,7 +2270,17 @@ async fn gather_responses(
             s3_prefix,
             sanitize_segment(&response.name)
         );
-        let contents = state.ssh_service.list_remote_dir(&response.path).await?;
+        let contents = state
+            .ssh_service
+            .list_remote_dir(&response.path)
+            .await
+            .map_err(|err| {
+                error!(
+                    "Error al listar directorio remoto {}: {}",
+                    response.path, err
+                );
+                err
+            })?;
         for content in contents {
             if content.is_dir {
                 match content.name.to_lowercase().as_str() {
@@ -2147,7 +2337,16 @@ async fn process_case_file_tasks(
         let storage = Arc::clone(&storage);
 
         async move {
-            let bytes = ssh.read_remote_file(&task.remote_path).await?;
+            let bytes = ssh
+                .read_remote_file(&task.remote_path)
+                .await
+                .map_err(|err| {
+                    error!(
+                        "Error al leer archivo remoto {}: {}",
+                        task.remote_path, err
+                    );
+                    err
+                })?;
             let html_body = if task.capture_main_html {
                 Some(
                     String::from_utf8(bytes.clone())

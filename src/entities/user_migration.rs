@@ -45,6 +45,7 @@ pub struct NormalizedUser {
     pub department_name: String,
     pub campaign_key: String,
     pub department_key: String,
+    pub password_changed_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
     pub last_connection: Option<NaiveDateTime>,
     pub status: i32,
@@ -83,9 +84,11 @@ pub struct MongoUserDocument {
     #[serde(rename = "cu_date_registration")]
     pub date_registration: Option<BsonDateTime>,
     #[serde(rename = "cu_date_change_password")]
-    pub date_change_password: Option<DateTime<Utc>>,
+    pub date_change_password: Option<BsonDateTime>,
     #[serde(rename = "cu_date_last_connection")]
     pub date_last_connection: Option<BsonDateTime>,
+    #[serde(rename = "cu_date_migration")]
+    pub date_migration: Option<BsonDateTime>,
     #[serde(rename = "cu_color")]
     pub color: String,
     pub settings: UserSettingsDocument,
@@ -117,6 +120,7 @@ impl Default for MongoUserDocument {
             date_registration: None,
             date_change_password: None,
             date_last_connection: None,
+            date_migration: None,
             color: String::new(),
             settings: UserSettingsDocument::default(),
             time_server: None,
@@ -204,65 +208,89 @@ pub fn normalize_lookup_key(value: &str) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSettingsDocument {
-    #[serde(rename = "cc_correos")]
-    pub cc_emails: bool,
-    #[serde(rename = "cc_whatsapp")]
-    pub cc_whatsapp: bool,
-    #[serde(rename = "cc_redes_sociales")]
-    pub cc_social_networks: bool,
-    #[serde(rename = "cc_ticket")]
-    pub cc_ticket: bool,
-    #[serde(rename = "cc_formularios")]
-    pub cc_forms: bool,
-    #[serde(rename = "cc_formularios_aeromar")]
-    pub cc_forms_aeromar: bool,
-    #[serde(rename = "cc_informes")]
-    pub cc_reports: bool,
-    #[serde(rename = "cc_graficas")]
-    pub cc_charts: bool,
-    #[serde(rename = "cc_calidad")]
-    pub cc_quality: bool,
-    #[serde(rename = "cc_directorio")]
-    pub cc_directory: bool,
-    #[serde(rename = "cc_difusion")]
-    pub cc_broadcast: bool,
-    #[serde(rename = "cc_grabaciones")]
-    pub cc_recordings: bool,
-    #[serde(rename = "cc_capacitacion")]
-    pub cc_training: bool,
-    #[serde(rename = "cc_reclutamiento")]
-    pub cc_recruitment: bool,
-    #[serde(rename = "cc_administracion")]
-    pub cc_administration: bool,
-    #[serde(rename = "cc_aditional")]
-    pub cc_additional: String,
-    #[serde(rename = "cc_date_registration")]
-    pub cc_date_registration: Option<DateTime<Utc>>,
-    #[serde(rename = "_id")]
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
+    #[serde(rename = "cc_date_registration")]
+    pub cc_date_registration: Option<BsonDateTime>,
+    #[serde(rename = "cc_correos")]
+    pub cc_emails: Option<bool>,
+    #[serde(rename = "cc_redes_sociales")]
+    pub cc_social_networks: Option<bool>,
+    #[serde(rename = "cc_whatsapp")]
+    pub cc_whatsapp: Option<bool>,
+    #[serde(rename = "cc_ticket")]
+    pub cc_ticket: Option<bool>,
+    #[serde(rename = "cc_comunicaciones")]
+    pub cc_communications: Option<bool>,
+    #[serde(rename = "cc_formularios")]
+    pub cc_forms: Option<bool>,
+    #[serde(rename = "cc_formulario_cognito")]
+    pub cc_form_cognito: Option<bool>,
+    #[serde(rename = "cc_formularios_aeromar")]
+    pub cc_forms_aeromar: Option<bool>,
+    #[serde(rename = "cc_informes")]
+    pub cc_reports: Option<bool>,
+    #[serde(rename = "cc_vicidial")]
+    pub cc_vicidial: Option<bool>,
+    #[serde(rename = "cc_graficas")]
+    pub cc_charts: Option<bool>,
+    #[serde(rename = "cc_calidad")]
+    pub cc_quality: Option<bool>,
+    #[serde(rename = "cc_directorio")]
+    pub cc_directory: Option<bool>,
+    #[serde(rename = "cc_difusion")]
+    pub cc_broadcast: Option<bool>,
+    #[serde(rename = "cc_chat_interno")]
+    pub cc_internal_chat: Option<bool>,
+    #[serde(rename = "cc_acceso_ia")]
+    pub cc_ai_access: Option<bool>,
+    #[serde(rename = "cc_grabaciones")]
+    pub cc_recordings: Option<bool>,
+    #[serde(rename = "cc_capacitacion")]
+    pub cc_training: Option<bool>,
+    #[serde(rename = "cc_reclutamiento")]
+    pub cc_recruitment: Option<bool>,
+    #[serde(rename = "cc_sala_de_juegos")]
+    pub cc_game_room: Option<bool>,
+    #[serde(rename = "cc_administracion")]
+    pub cc_administration: Option<bool>,
+    #[serde(rename = "cc_aditional")]
+    pub cc_additional: Option<String>,
+    #[serde(rename = "cc_assigned_emails")]
+    pub cc_assigned_emails: Option<String>,
+    #[serde(rename = "cc_bitacora")]
+    pub cc_logbook: Option<bool>,
 }
 
 impl Default for UserSettingsDocument {
     fn default() -> Self {
         Self {
-            cc_emails: false,
-            cc_whatsapp: false,
-            cc_social_networks: false,
-            cc_ticket: true,
-            cc_forms: false,
-            cc_forms_aeromar: false,
-            cc_reports: false,
-            cc_charts: false,
-            cc_quality: false,
-            cc_directory: false,
-            cc_broadcast: false,
-            cc_recordings: false,
-            cc_training: false,
-            cc_recruitment: false,
-            cc_administration: false,
-            cc_additional: "{}".to_string(),
-            cc_date_registration: None,
             id: None,
+            cc_date_registration: None,
+            cc_emails: None,
+            cc_social_networks: None,
+            cc_whatsapp: None,
+            cc_ticket: None,
+            cc_communications: None,
+            cc_forms: None,
+            cc_form_cognito: None,
+            cc_forms_aeromar: None,
+            cc_reports: None,
+            cc_vicidial: None,
+            cc_charts: None,
+            cc_quality: None,
+            cc_directory: None,
+            cc_broadcast: None,
+            cc_internal_chat: None,
+            cc_ai_access: None,
+            cc_recordings: None,
+            cc_training: None,
+            cc_recruitment: None,
+            cc_game_room: None,
+            cc_administration: None,
+            cc_additional: None,
+            cc_assigned_emails: None,
+            cc_logbook: None,
         }
     }
 }
