@@ -34,6 +34,8 @@ pub struct MsgStructDocument {
     pub fechas_estatus: Option<DateTime>,
     #[serde(rename = "Nombre_cliente")]
     pub nombre_cliente: Option<String>,
+    #[serde(rename = "Nombre_Pasajero")]
+    pub nombre_pasajero: Option<String>,
     #[serde(rename = "Estatus")]
     pub estatus: Option<String>,
     #[serde(rename = "Agente_asignado")]

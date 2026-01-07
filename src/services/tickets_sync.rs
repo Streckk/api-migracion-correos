@@ -843,7 +843,8 @@ async fn sync_responses_for_case(
             configuration_id,
             mime_id,
             case_id,
-            &subject
+            &subject,
+            mysql_record.nombre_cliente.clone(),
         );
 
         mongo::insert_msg_struct(state, &db_name, &msg_struct_doc).await?;
