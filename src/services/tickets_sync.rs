@@ -13,6 +13,8 @@ use crate::{
     mappers::ticket_documents::{
         build_note_mime,
         build_note_struct,
+        build_outgoing_mime,
+        build_outgoing_struct,
         build_response_mime,
         build_response_struct,
         build_ticket_mime,
@@ -25,15 +27,21 @@ use crate::{
     routes::structs::{ MessageSyncResponse, TicketSyncResponse },
     services::tickets_batches::{ case_batch_size, case_parallelism, run_batches },
     services::tickets_files::{
-        build_files_from_s3, gather_case_files, process_case_file_tasks, TicketsFilesError,
+        build_files_from_s3,
+        gather_case_files,
+        gather_outgoing_files,
+        process_case_file_tasks,
+        TicketsFilesError,
     },
     services::tickets_responses::{ message_sync_body, ticket_batch_body },
     services::mysql::{
         fetch_case_ids_by_range,
         fetch_case_notes,
+        fetch_case_outgoing,
         fetch_case_responses,
         fetch_mysql_record,
         fetch_note_case_ids,
+        fetch_outgoing_case_ids,
         fetch_response_case_ids,
         DateBounds,
         MysqlEmailRecord,
@@ -454,6 +462,115 @@ pub async fn sync_responses_by_range(
     (StatusCode::OK, body).into_response()
 }
 
+pub async fn sync_outgoing_by_range(
+    State(state): State<AppState>,
+    Query(range): Query<DateRangeQuery>,
+) -> Response {
+    let case_override = range
+        .num_caso
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let (bounds, case_ids) = if let Some(case_id) = case_override.clone() {
+        info!("Salidas - Modo num_caso activo: {}", case_id);
+        (None, vec![case_id])
+    } else {
+        let Some(bounds) = range.resolved_bounds() else {
+            let body = message_sync_body(
+                "error",
+                "Debes proporcionar al menos fecha_inicio o num_caso".to_string(),
+                0,
+                Vec::new(),
+                Vec::new(),
+            );
+            return (StatusCode::BAD_REQUEST, body).into_response();
+        };
+
+        let case_ids = match fetch_outgoing_case_ids(&state, &bounds).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                let err = TicketSyncError::from(err);
+                let status = err.status_code();
+                let body = message_sync_body("error", err.to_string(), 0, Vec::new(), Vec::new());
+                return (status, body).into_response();
+            }
+        };
+
+        info!(
+            "Salidas - Modo rango activo: {} a {} (casos {})",
+            bounds.start,
+            bounds.end,
+            case_ids.len()
+        );
+        (Some(bounds), case_ids)
+    };
+
+    info!("Salidas - Casos encontrados: {}", case_ids.len());
+
+    if case_ids.is_empty() {
+        let detail = if let Some(case_id) = case_override {
+            format!("No se encontraron correos de salida para el caso {}", case_id)
+        } else {
+            "No se encontraron correos de salida en el rango solicitado".to_string()
+        };
+        let body = message_sync_body("ok", detail, 0, Vec::new(), Vec::new());
+        return (StatusCode::OK, body).into_response();
+    }
+
+    let batch_size = case_batch_size();
+    let case_parallel = case_parallelism();
+    let bounds = bounds.clone();
+    let results = run_batches(
+        &state,
+        case_ids,
+        batch_size,
+        case_parallel,
+        "Salidas",
+        |case_id| case_id.clone(),
+        move |state, case_id| {
+            let bounds = bounds.clone();
+            async move { sync_outgoing_for_case(&state, &case_id, bounds.as_ref()).await }
+        },
+    )
+    .await;
+
+    let mut total_inserted = 0;
+    let mut mime_ids = Vec::new();
+    let mut msg_struct_ids = Vec::new();
+    let mut failures = Vec::new();
+    for (case_id, result) in results {
+        match result {
+            Ok(summary) => {
+                total_inserted += summary.inserted;
+                mime_ids.extend(summary.mime_ids);
+                msg_struct_ids.extend(summary.msg_struct_ids);
+            }
+            Err(err) => {
+                error!("Fallo al sincronizar salidas del ticket {}: {}", case_id, err);
+                failures.push(format!("{}: {}", case_id, err));
+            }
+        }
+    }
+
+    let status = if failures.is_empty() { "ok" } else { "partial" };
+    let detail = if failures.is_empty() {
+        format!("Se migraron {} salidas", total_inserted)
+    } else {
+        format!("Se migraron {} salidas; {} casos fallaron", total_inserted, failures.len())
+    };
+
+    if !failures.is_empty() {
+        if let Err(err) = write_errors_file("tickets_outgoing_errors.txt", &failures).await {
+            warn!("No se pudo escribir archivo de errores: {err}");
+        }
+    }
+
+    let body = message_sync_body(status, detail, total_inserted, mime_ids, msg_struct_ids);
+    (StatusCode::OK, body).into_response()
+}
+
 async fn sync_ticket_case(
     state: &AppState,
     mysql_record: MysqlEmailRecord
@@ -752,6 +869,170 @@ async fn sync_responses_for_case(
     })
 }
 
+async fn sync_outgoing_for_case(
+    state: &AppState,
+    case_id: &str,
+    bounds: Option<&DateBounds>,
+) -> Result<MessageSyncResponse, TicketSyncError> {
+    let mysql_record = fetch_mysql_record(state, case_id).await?.ok_or_else(|| {
+        TicketSyncError::CaseNotFound(case_id.to_string())
+    })?;
+    let db_name = env::var("MONGO_DB_NAME").unwrap_or_else(|_| "correos_exchange_queretaro".into());
+    let config_collection_name = env
+        ::var("MONGO_CONFIG_COLLECTION")
+        .unwrap_or_else(|_| "configuration".into());
+
+    let config_email = mysql_record
+        .config_email
+        .clone()
+        .ok_or_else(|| TicketSyncError::MissingConfigurationEmail(case_id.to_string()))?;
+
+    let outgoing = fetch_case_outgoing(state, case_id, bounds).await?;
+    if outgoing.is_empty() {
+        return Ok(MessageSyncResponse {
+            status: "ok".to_string(),
+            detail: format!("No se encontraron correos de salida para el caso {}", case_id),
+            inserted: 0,
+            mime_ids: Vec::new(),
+            msg_struct_ids: Vec::new(),
+        });
+    }
+
+    let sanitized_case = sanitize_segment(case_id);
+    let base_prefix = format!("tickets/{}", sanitized_case);
+    let base_path = env::var("SSH_REMOTE_PATH_SALIDA")
+        .unwrap_or_else(|_| state.ssh_service.base_path().to_string());
+    let base_path = base_path.trim_end_matches('/');
+
+    let mut outgoing_with_paths = Vec::with_capacity(outgoing.len());
+    for outgoing in outgoing {
+        info!(
+            "Salida {} caso {}: Usuario leido en MySQL = {:?}",
+            outgoing.id, case_id, outgoing.usuario
+        );
+        let usuario = outgoing
+            .usuario
+            .clone()
+            .ok_or_else(|| TicketSyncError::MissingOutgoingPathData("Usuario".to_string()))?;
+        let fecha = outgoing
+            .fecha_registro
+            .as_ref()
+            .and_then(|value| value.split_whitespace().next())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                TicketSyncError::MissingOutgoingPathData("Fecha_de_Registro".to_string())
+            })?;
+        let remote_path = format!("{}/{}/{}/{}", base_path, usuario, fecha, outgoing.id);
+        info!(
+            "Salida {} caso {}: ruta remota construida {}",
+            outgoing.id, case_id, remote_path
+        );
+        outgoing_with_paths.push((outgoing, remote_path));
+    }
+
+    let Some(configuration_id) = mongo::find_configuration_id(
+        state,
+        &db_name,
+        &config_collection_name,
+        &config_email,
+    )
+    .await?
+    else {
+        return Err(TicketSyncError::ConfigurationNotFound(config_email));
+    };
+
+    let mut inserted_mime_ids = Vec::new();
+    let mut inserted_struct_ids = Vec::new();
+    let mut skipped = 0usize;
+
+    for (outgoing, remote_path) in outgoing_with_paths {
+        if mongo::msg_struct_exists(
+            state,
+            &db_name,
+            doc! { "id_mail": outgoing.id, "message_type": "salida", "num_caso": case_id },
+        )
+        .await?
+        {
+            info!(
+                "Salida {} del caso {} ya existe en MongoDB, se omite",
+                outgoing.id, case_id
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let folder = sanitize_segment(&format!("Salida_Num_-_{}", outgoing.id));
+        let prefix = format!("{}/salidas/{}", base_prefix, folder);
+
+        let tasks = gather_outgoing_files(state, &remote_path, &prefix).await?;
+        let (uploaded_urls, files, html_body) = process_case_file_tasks(state, tasks).await?;
+        if files.is_empty() {
+            warn!(
+                "Salida {} del caso {} no tiene archivos en ruta {}",
+                outgoing.id, case_id, remote_path
+            );
+        }
+
+        let html_body = html_body.or_else(|| outgoing.mensaje_txt.clone());
+        let subject = outgoing
+            .asunto
+            .clone()
+            .unwrap_or_else(|| format!("Salida {}", outgoing.id));
+        let html_content = select_html_content(
+            html_body,
+            &files,
+            subject.clone(),
+            "tickets/obtener_correos_salida",
+            case_id,
+        );
+
+        let mime_document = build_outgoing_mime(
+            configuration_id,
+            subject.clone(),
+            html_content,
+            files,
+        );
+        let mime_id = mime_document.id;
+        mongo::insert_msg_mime(state, &db_name, &mime_document).await?;
+
+        let msg_struct_doc = build_outgoing_struct(
+            &outgoing,
+            configuration_id,
+            mime_id,
+            case_id,
+            &subject,
+        );
+
+        mongo::insert_msg_struct(state, &db_name, &msg_struct_doc).await?;
+
+        info!(
+            "Salida {} del caso {} sincronizada. Archivos subidos: {}",
+            outgoing.id,
+            case_id,
+            uploaded_urls.len()
+        );
+
+        inserted_mime_ids.push(mime_id.to_hex());
+        inserted_struct_ids.push(msg_struct_doc.id.to_hex());
+    }
+
+    let inserted = inserted_struct_ids.len();
+    info!(
+        "Salidas caso {}: total {} | insertadas {} | omitidas {}",
+        case_id,
+        inserted + skipped,
+        inserted,
+        skipped
+    );
+    Ok(MessageSyncResponse {
+        status: "ok".to_string(),
+        detail: format!("Se migraron {} salidas para el caso {}", inserted, case_id),
+        inserted,
+        mime_ids: inserted_mime_ids,
+        msg_struct_ids: inserted_struct_ids,
+    })
+}
+
 async fn write_errors_file(path: &str, failures: &[String]) -> Result<(), std::io::Error> {
     if failures.is_empty() {
         return Ok(());
@@ -769,6 +1050,7 @@ enum TicketSyncError {
     #[error("No se encontró configuración en MongoDB para el correo {0}")] ConfigurationNotFound(
         String,
     ),
+    #[error("Falta dato requerido para ruta de salida: {0}")] MissingOutgoingPathData(String),
     #[error(transparent)] Mysql(#[from] sea_orm::DbErr),
     #[error(transparent)] Files(#[from] TicketsFilesError),
     #[error(transparent)] Mongo(#[from] mongodb::error::Error),
@@ -780,7 +1062,8 @@ impl TicketSyncError {
             TicketSyncError::CaseNotFound(_) | TicketSyncError::ConfigurationNotFound(_) => {
                 StatusCode::NOT_FOUND
             }
-            TicketSyncError::MissingConfigurationEmail(_) => StatusCode::BAD_REQUEST,
+            TicketSyncError::MissingConfigurationEmail(_)
+            | TicketSyncError::MissingOutgoingPathData(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

@@ -19,6 +19,7 @@ pub fn router() -> Router<AppState> {
         .route("/tickets/sync", post(tickets_sync::sync_tickets_by_range))
         .route("/tickets/obtener_correos_notas", post(tickets_sync::sync_notes_by_range))
         .route("/tickets/obtener_correos_respuesta", post(tickets_sync::sync_responses_by_range))
+        .route("/tickets/obtener_correos_salida", post(tickets_sync::sync_outgoing_by_range))
         .route("/users/sync", post(sync_users))
 }
 

@@ -47,6 +47,21 @@ pub struct MysqlResponseRecord {
     pub fecha_cliente: Option<String>,
 }
 
+pub struct MysqlOutgoingRecord {
+    pub id: i64,
+    pub fecha_registro: Option<String>,
+    pub usuario: Option<String>,
+    pub correo_remitente: Option<String>,
+    pub correo_destinatario: Option<String>,
+    pub correo_para: Vec<String>,
+    pub correo_cc: Vec<String>,
+    pub correo_cco: Vec<String>,
+    pub asunto: Option<String>,
+    pub mensaje_txt: Option<String>,
+    pub num_caso: Option<String>,
+    pub estatus: Option<String>,
+}
+
 pub async fn fetch_case_ids_by_range(
     state: &AppState,
     bounds: &DateBounds,
@@ -66,6 +81,13 @@ pub async fn fetch_response_case_ids(
     bounds: &DateBounds,
 ) -> Result<Vec<String>, sea_orm::DbErr> {
     fetch_distinct_case_ids(state, "correos_respuesta", "Fecha_de_Registro", bounds).await
+}
+
+pub async fn fetch_outgoing_case_ids(
+    state: &AppState,
+    bounds: &DateBounds,
+) -> Result<Vec<String>, sea_orm::DbErr> {
+    fetch_distinct_case_ids(state, "correos_salida", "Fecha_de_Registro", bounds).await
 }
 
 pub async fn fetch_mysql_record(
@@ -131,7 +153,7 @@ pub async fn fetch_case_notes(
         }
         records.push(MysqlNoteRecord {
             id,
-            usuario: get_string(&row, "Usuario"),
+            usuario: get_any_string(&row, &["Usuario", "usuario"]),
             fecha_registro: get_string(&row, "Fecha_de_Registro"),
         });
     }
@@ -167,6 +189,51 @@ pub async fn fetch_case_responses(
             asunto: get_string(&row, "Asunto"),
             fecha_registro: get_string(&row, "Fecha_de_Registro"),
             fecha_cliente: get_string(&row, "Fecha_Cliente"),
+        });
+    }
+
+    Ok(records)
+}
+
+pub async fn fetch_case_outgoing(
+    state: &AppState,
+    case_id: &str,
+    bounds: Option<&DateBounds>,
+) -> Result<Vec<MysqlOutgoingRecord>, sea_orm::DbErr> {
+    let mut sql = "SELECT * FROM correos_salida WHERE Num_Caso = ?".to_string();
+    let mut values = vec![case_id.to_string().into()];
+    if let Some(bounds) = bounds {
+        append_date_filters(&mut sql, &mut values, "Fecha_de_Registro", bounds);
+    }
+    sql.push_str(" ORDER BY Fecha_de_Registro ASC");
+
+    let statement = Statement::from_sql_and_values(DbBackend::MySql, sql, values);
+    let rows = state.mysql.query_all_raw(statement).await?;
+    let mut records = Vec::new();
+
+    for row in rows {
+        let id = row.try_get::<i64>("", "Id").unwrap_or(0);
+        if id == 0 {
+            continue;
+        }
+        let correo_destinatario = get_any_string(&row, &["Correo_Destinatario", "correo_Destinatario"]);
+        let correo_para = split_emails(get_any_string(&row, &["correo_Para", "Correo_Para", "Correo_para"]));
+        let correo_cc = split_emails(get_any_string(&row, &["correo_CC", "Correo_CC", "Correo_cc"]));
+        let correo_cco = split_emails(get_any_string(&row, &["correo_CCO", "Correo_CCO", "Correo_cco"]));
+
+        records.push(MysqlOutgoingRecord {
+            id,
+            fecha_registro: get_string(&row, "Fecha_de_Registro"),
+            usuario: get_string(&row, "Usuario"),
+            correo_remitente: get_any_string(&row, &["Correo_Remitente", "correo_Remitente"]),
+            correo_destinatario,
+            correo_para,
+            correo_cc,
+            correo_cco,
+            asunto: get_string(&row, "Asunto"),
+            mensaje_txt: get_any_string(&row, &["Mensaje_txt", "Mensaje_Txt", "mensaje_txt"]),
+            num_caso: get_string(&row, "Num_Caso"),
+            estatus: get_string(&row, "Estatus"),
         });
     }
 

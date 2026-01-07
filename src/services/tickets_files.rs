@@ -68,6 +68,39 @@ pub async fn gather_case_files(
     Ok(tasks)
 }
 
+pub async fn gather_outgoing_files(
+    state: &AppState,
+    remote_dir: &str,
+    s3_prefix: &str,
+) -> Result<Vec<FileTask>, TicketsFilesError> {
+    info!("Listando archivos de salida en ruta remota: {}", remote_dir);
+    let mut tasks = Vec::new();
+    let mut stack = vec![(remote_dir.to_string(), s3_prefix.to_string())];
+    while let Some((current_dir, current_prefix)) = stack.pop() {
+        let entries = state
+            .ssh_service
+            .list_remote_dir(&current_dir)
+            .await
+            .map_err(|err| {
+                error!("Error al listar directorio remoto {}: {}", current_dir, err);
+                err
+            })?;
+
+        for entry in entries {
+            if entry.is_dir {
+                let next_prefix =
+                    format!("{}/{}", current_prefix, sanitize_segment(&entry.name));
+                stack.push((entry.path, next_prefix));
+                continue;
+            }
+
+            let capture_html = entry.name.eq_ignore_ascii_case("index.html");
+            let key = format!("{}/{}", current_prefix, sanitize_segment(&entry.name));
+            tasks.push(FileTask::from_entry(entry, key, capture_html));
+        }
+    }
+    Ok(tasks)
+}
 async fn gather_case_files_into(
     state: &AppState,
     remote_case_path: &str,

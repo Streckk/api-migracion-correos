@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::{
     entities::msg_mime::{MsgMimeDocument, MsgMimeFile},
     entities::msg_struct::{MsgContact, MsgStructDocument},
-    services::mysql::{MysqlEmailRecord, MysqlNoteRecord, MysqlResponseRecord},
+    services::mysql::{MysqlEmailRecord, MysqlNoteRecord, MysqlOutgoingRecord, MysqlResponseRecord},
 };
 
 const MAX_HTML_BYTES: usize = 15 * 1024 * 1024;
@@ -172,6 +172,75 @@ pub fn build_response_struct(
     }
 }
 
+pub fn build_outgoing_mime(
+    configuration_id: ObjectId,
+    subject: String,
+    html: String,
+    files: Vec<MsgMimeFile>,
+) -> MsgMimeDocument {
+    MsgMimeDocument {
+        id: ObjectId::new(),
+        configuration_id,
+        message_type: "salida".to_string(),
+        text: subject,
+        file_mime: "text/html".to_string(),
+        html,
+        is_file_local: false,
+        files,
+    }
+}
+
+pub fn build_outgoing_struct(
+    record: &MysqlOutgoingRecord,
+    configuration_id: ObjectId,
+    mime_id: ObjectId,
+    case_id: &str,
+    subject: &str,
+) -> MsgStructDocument {
+    let agente_asignado = record.usuario.clone();
+    let mut to_emails = record.correo_para.clone();
+    if let Some(dest) = record.correo_destinatario.clone() {
+        if !to_emails.contains(&dest) {
+            to_emails.push(dest);
+        }
+    }
+    let mut cc_emails = record.correo_cc.clone();
+    for email in &record.correo_cco {
+        if !cc_emails.contains(email) {
+            cc_emails.push(email.clone());
+        }
+    }
+
+    MsgStructDocument {
+        id: ObjectId::new(),
+        id_mail: record.id,
+        mime_id,
+        configuration_id,
+        date_creation: parse_mysql_datetime(record.fecha_registro.as_deref()),
+        date_buzon: None,
+        from: record.correo_remitente.as_ref().map(|email| MsgContact {
+            name: agente_asignado.clone(),
+            email: Some(email.clone()),
+        }),
+        to: contacts_from_emails(&to_emails),
+        cc: contacts_from_emails(&cc_emails),
+        message_type: "salida".to_string(),
+        subject: Some(subject.to_string()),
+        conversation: Some(case_id.to_string()),
+        num_caso: Some(case_id.to_string()),
+        fechas_estatus: None,
+        nombre_cliente: None,
+        estatus: record.estatus.clone(),
+        agente_asignado,
+        categoria: None,
+        subcategoria: None,
+        fecha_cerrada: None,
+        fecha_cliente: None,
+        numero_lineas: None,
+        lista_caso: None,
+    }
+}
+
 pub fn contacts_from_emails(emails: &[String]) -> Vec<MsgContact> {
     emails
         .iter()
@@ -292,6 +361,7 @@ fn find_index_html_url(files: &[MsgMimeFile], endpoint: &str) -> Option<String> 
         "tickets/sync" => "/original/index.html",
         "tickets/obtener_correos_notas" => "/notas/",
         "tickets/obtener_correos_respuesta" => "/respuestas/",
+        "tickets/obtener_correos_salida" => "/salidas/",
         _ => "",
     };
 
