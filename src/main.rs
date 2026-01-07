@@ -9,6 +9,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 mod auth;
 mod entities;
 mod routes;
+mod services;
+mod mappers;
 mod ssh;
 mod state;
 mod storage;
